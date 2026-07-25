@@ -52,6 +52,30 @@ WBK_HOSTAGENT_DIR="/opt/wbk-hostagent"
 WBK_DEPLOY_KEY_PATH="/opt/wbk-secrets/deploy_key"
 DEFAULT_REPO_URL="git@github.com:weboook/wbk.git"
 DEFAULT_RELEASE_CHANNEL="v*"
+# --target=native's persistent-data root (see docs/architecture/
+# native-deployment.md) -- deliberately not nested under $WBK_INSTALL_DIR,
+# same EXDEV/rm-rf-safety reasoning as WBK_DEPLOY_KEY_PATH above. Defined
+# here (not just in scripts/lib/native-install.sh) so write_env_file()
+# below can reference it before that file is sourced -- native-install.sh
+# is only sourced once fetch_release() has put a verified checkout at
+# $WBK_INSTALL_DIR, which happens after write_env_file() runs in main().
+WBK_DATA_ROOT_NATIVE="${WBK_DATA_ROOT_NATIVE:-/var/lib/wbk}"
+
+# ConfigServer Ltd (the original upstream of CSF, download.configserver.com)
+# shut down permanently on 2025-08-31 -- that URL stopped resolving at all
+# (confirmed for real: a production install of this script hit
+# "curl: (6) Could not resolve host: download.configserver.com" and the
+# whole install aborted, since the old code had no fallback and no error
+# handling around that one curl call). CSF development continues at this
+# GitHub repo, an active continuation fork (real ongoing commits/releases
+# since the shutdown, not a frozen mirror) that publishes GPG-signed GitHub
+# Releases with a SHA256 checksum for each asset in the release notes body --
+# fetch_and_verify_csf() below checks that checksum before anything is ever
+# extracted. Overridable in case this source also goes away someday; nothing
+# else in install_csf()/fetch_and_verify_csf() assumes this specific repo,
+# only that it publishes a GitHub Release with a .tgz asset and a same-line
+# SHA256 in the release body.
+CSF_SOURCE_REPO="${WBK_CSF_SOURCE_REPO:-Aetherinox/csf-firewall}"
 
 # The one pinned release-signing public key this installer will ever trust,
 # embedded directly rather than read from the fetched release itself --
@@ -151,6 +175,14 @@ SKIP_CSF=0
 REPO_URL="${WBK_REPO_URL:-$DEFAULT_REPO_URL}"
 RELEASE_CHANNEL="${WBK_RELEASE_CHANNEL:-$DEFAULT_RELEASE_CHANNEL}"
 DEPLOY_KEY_MODE="${WBK_DEPLOY_KEY_MODE:-generate}"  # generate | paste
+# docker (default): everything runs in the existing container topology,
+# completely unchanged (docker-compose.yml/Dockerfile/docker/*.conf are
+# never touched by this script either way). native: real systemd units,
+# apt packages, and a /opt/wbk (code) + /var/lib/wbk (data) layout on the
+# bare host instead -- see docs/architecture/native-deployment.md and
+# scripts/lib/native-install.sh, which this script sources and calls only
+# when this is "native".
+TARGET="${WBK_TARGET:-docker}"
 
 for arg in "$@"; do
   case "$arg" in
@@ -160,6 +192,7 @@ for arg in "$@"; do
     --skip-csf) SKIP_CSF=1 ;;
     --repo=*) REPO_URL="${arg#--repo=}" ;;
     --channel=*) RELEASE_CHANNEL="${arg#--channel=}" ;;
+    --target=*) TARGET="${arg#--target=}" ;;
     -h|--help)
       cat <<'EOF'
 Usage: install.sh [options]
@@ -169,10 +202,17 @@ Usage: install.sh [options]
   --skip-csf               Skip CSF + wbk-hostagent setup entirely.
   --repo=URL               Override the default panel repo SSH URL.
   --channel=GLOB           Release tag glob to install (default: v*).
+  --target=docker|native   Deployment target (default: docker). native installs
+                           everything as real systemd units directly on this
+                           host instead of via Docker -- see
+                           docs/architecture/native-deployment.md.
 Environment overrides (for --unattended use):
   WBK_PANEL_DOMAIN, WBK_PANEL_IP, WBK_ADMIN_EMAIL, WBK_ADMIN_PASSWORD,
   WBK_PANEL_HOST_PORT, WBK_TENANT_HOST_PORT, WBK_DEPLOY_KEY_MODE (generate|paste),
-  WBK_DEPLOY_KEY_PRIVATE (required if WBK_DEPLOY_KEY_MODE=paste)
+  WBK_DEPLOY_KEY_PRIVATE (required if WBK_DEPLOY_KEY_MODE=paste),
+  WBK_CSF_SOURCE_REPO (GitHub "owner/repo" to fetch CSF from, default
+  Aetherinox/csf-firewall -- override if that source ever goes away too),
+  WBK_TARGET (docker|native, same as --target)
 EOF
       exit 0
       ;;
@@ -356,6 +396,7 @@ ADMIN_PASSWORD_GENERATED=0
 PANEL_HOST_PORT="8080"
 TENANT_HOST_PORT="8090"
 ENV_BACKUP=""
+CSF_SETUP_FAILED=0
 
 detect_public_ip() {
   curl -fsSL --max-time 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true
@@ -458,16 +499,84 @@ detect_ssh_port() {
   echo "${port:-22}"
 }
 
+ensure_jq() {
+  command -v jq >/dev/null 2>&1 && return
+  info "installing jq (needed to parse CSF's GitHub release metadata)"
+  apt-get update -qq && apt-get install -y -qq jq
+}
+
+fetch_and_verify_csf() {
+  # Populates $tmp_dir/csf.tgz. Returns non-zero (never `die`s) on any
+  # failure -- a CSF download hiccup should never take down the rest of the
+  # install, unlike the old unconditional `curl ... -o ...` this replaced,
+  # which under `set -e` aborted the entire script (including bringing up
+  # the panel itself) the moment DNS resolution failed.
+  local tmp_dir="$1" api_url release_json tag asset_name asset_url expected_sha actual_sha
+
+  api_url="https://api.github.com/repos/${CSF_SOURCE_REPO}/releases/latest"
+  release_json="$(curl -fsSL --max-time 15 "$api_url" 2>/dev/null)" || {
+    warn "could not reach $api_url"
+    return 1
+  }
+
+  tag="$(jq -r '.tag_name // empty' <<<"$release_json" 2>/dev/null || true)"
+  asset_name="$(jq -r '[.assets[]? | select(.name | test("\\.tgz$"))][0].name // empty' <<<"$release_json" 2>/dev/null || true)"
+  asset_url="$(jq -r '[.assets[]? | select(.name | test("\\.tgz$"))][0].browser_download_url // empty' <<<"$release_json" 2>/dev/null || true)"
+
+  if [ -z "$asset_url" ]; then
+    warn "release ${tag:-latest} from $CSF_SOURCE_REPO has no .tgz asset"
+    return 1
+  fi
+
+  info "fetching CSF $tag from $CSF_SOURCE_REPO (download.configserver.com, the original upstream, has been permanently offline since 2025-08-31)"
+  curl -fsSL --max-time 60 "$asset_url" -o "$tmp_dir/csf.tgz" 2>/dev/null || {
+    warn "download of $asset_url failed"
+    return 1
+  }
+
+  # The published SHA256 lives inline in the release notes body next to the
+  # asset's filename (this fork doesn't publish a separate checksums.txt),
+  # so pull the 64-hex-char token off whichever line mentions this asset's
+  # name. Best-effort: if the release notes format ever changes and this
+  # can't find a checksum, warn and proceed anyway rather than treating a
+  # markdown-parsing miss as a hard failure -- the archive still only ever
+  # comes from this one GitHub-hosted release asset URL over HTTPS.
+  expected_sha="$(jq -r '.body // empty' <<<"$release_json" 2>/dev/null \
+    | grep -F "$asset_name" | grep -oE '[a-f0-9]{64}' | head -n1 || true)"
+
+  if [ -n "$expected_sha" ]; then
+    actual_sha="$(sha256sum "$tmp_dir/csf.tgz" | awk '{print $1}')"
+    if [ "$actual_sha" != "$expected_sha" ]; then
+      warn "SHA256 mismatch for $asset_name -- expected $expected_sha, got $actual_sha"
+      return 1
+    fi
+    info "SHA256 verified for $asset_name"
+  else
+    warn "could not find a published SHA256 for $asset_name in the release notes -- proceeding without checksum verification"
+  fi
+}
+
 install_csf() {
   if command -v csf >/dev/null 2>&1; then
     info "CSF already installed, skipping install (will still reconfigure)"
   else
-    info "installing CSF"
-    local tmp_dir
+    ensure_jq
+    local tmp_dir install_script
     tmp_dir="$(mktemp -d)"
-    curl -fsSL https://download.configserver.com/csf.tgz -o "$tmp_dir/csf.tgz"
+    if ! fetch_and_verify_csf "$tmp_dir"; then
+      warn "could not download/verify CSF from $CSF_SOURCE_REPO -- skipping CSF + firewall setup"
+      warn "the panel itself is unaffected; re-run this installer to retry (everything else is left untouched), or install CSF by hand and re-run with --force"
+      rm -rf "$tmp_dir"
+      return 1
+    fi
     tar -xzf "$tmp_dir/csf.tgz" -C "$tmp_dir"
-    (cd "$tmp_dir/csf" && sh install.sh)
+    install_script="$(find "$tmp_dir" -maxdepth 3 -name install.sh -print -quit)"
+    if [ -z "$install_script" ]; then
+      warn "downloaded CSF archive from $CSF_SOURCE_REPO didn't contain an install.sh -- skipping CSF + firewall setup"
+      rm -rf "$tmp_dir"
+      return 1
+    fi
+    (cd "$(dirname "$install_script")" && sh install.sh)
     rm -rf "$tmp_dir"
   fi
 
@@ -536,8 +645,11 @@ setup_csf_and_hostagent() {
     info "skipping CSF at your request"
     return
   fi
-  install_csf
-  install_hostagent
+  if install_csf; then
+    install_hostagent
+  else
+    CSF_SETUP_FAILED=1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -581,6 +693,26 @@ WEBAUTHN_ORIGIN=${origin}
 PANEL_HOST_PORT=${PANEL_HOST_PORT}
 TENANT_HOST_PORT=${TENANT_HOST_PORT}
 EOF
+
+  if [ "$TARGET" = "native" ]; then
+    # WBK_APP_ROOT/WBK_DATA_ROOT/WBK_SERVICE_MANAGER match wbkd.service /
+    # wbk-api.service's own Environment= lines (services/agent/*.service) --
+    # spelled out here too since app.core.config's pydantic Settings (unlike
+    # wbkd's plain os.environ.get reads) needs its own explicit overrides for
+    # every setting whose container default would otherwise still point at
+    # /app -- see docs/architecture/native-deployment.md's settings table.
+    cat >> "$WBK_INSTALL_DIR/.env" <<EOF
+WBK_APP_ROOT=${WBK_INSTALL_DIR}
+WBK_DATA_ROOT=${WBK_DATA_ROOT_NATIVE}
+WBK_SERVICE_MANAGER=systemd
+DATABASE_URL=sqlite:///${WBK_DATA_ROOT_NATIVE}/wbk.db
+BACKUP_STAGING_DIR=${WBK_DATA_ROOT_NATIVE}/backup-staging
+TICKET_ATTACHMENTS_DIR=${WBK_DATA_ROOT_NATIVE}/ticket-attachments
+UPDATES_DEPLOY_KEY_PATH=${WBK_DATA_ROOT_NATIVE}/updates/deploy_key
+RELEASE_SIGNING_PUBKEY_PATH=${WBK_INSTALL_DIR}/configs/updates/release-signing-key.asc
+EOF
+  fi
+
   chmod 600 "$WBK_INSTALL_DIR/.env"
 }
 
@@ -591,17 +723,37 @@ bring_up_panel() {
   (cd "$WBK_INSTALL_DIR" && docker compose up -d)
 }
 
+# The Docker target always reaches uvicorn through nginx's :8000/API-proxy
+# server block, itself mapped to PANEL_HOST_PORT by docker-compose's own
+# `ports:`. The native target's render_native_panel_nginx_vhost (see
+# scripts/lib/native-install.sh) listens on :80 directly in domain mode
+# (SSL/DNS features expect the panel's own vhost at the real public port),
+# or PANEL_HOST_PORT in IP mode, same as Docker -- so only domain-mode
+# native diverges from "check PANEL_HOST_PORT".
+health_check_port() {
+  if [ "$TARGET" = "native" ] && [ -n "$PANEL_DOMAIN" ]; then
+    echo "80"
+  else
+    echo "$PANEL_HOST_PORT"
+  fi
+}
+
 wait_for_health() {
   info "waiting for the panel to become healthy"
-  local _i
+  local _i port
+  port="$(health_check_port)"
   for _i in $(seq 1 60); do
-    if curl -fsS --max-time 3 "http://127.0.0.1:${PANEL_HOST_PORT}/api/health" >/dev/null 2>&1; then
+    if curl -fsS --max-time 3 "http://127.0.0.1:${port}/api/health" >/dev/null 2>&1; then
       info "panel is healthy"
       return
     fi
     sleep 2
   done
-  warn "panel did not report healthy within two minutes -- check 'docker compose logs' in $WBK_INSTALL_DIR"
+  if [ "$TARGET" = "native" ]; then
+    warn "panel did not report healthy within two minutes -- check 'systemctl status wbk-api wbkd' and 'journalctl -u wbk-api -u wbkd'"
+  else
+    warn "panel did not report healthy within two minutes -- check 'docker compose logs' in $WBK_INSTALL_DIR"
+  fi
 }
 
 print_summary() {
@@ -626,6 +778,10 @@ print_summary() {
   echo >&2
   if [ "$SKIP_CSF" != "1" ] && command -v csf >/dev/null 2>&1; then
     echo " Firewall: CSF active, managed from Settings -> Firewall in the panel" >&2
+  elif [ "$CSF_SETUP_FAILED" = "1" ]; then
+    echo " Firewall: CSF setup FAILED (see warnings above) -- panel is up regardless." >&2
+    echo "           Re-run this installer to retry (everything else is left" >&2
+    echo "           untouched), or install CSF by hand." >&2
   fi
   echo " Install:  $WBK_INSTALL_DIR (.env holds every generated secret)" >&2
   echo " Updates:  Settings -> Updates in the panel from here on (git + this" >&2
@@ -638,13 +794,20 @@ print_summary() {
 # ---------------------------------------------------------------------------
 
 main() {
+  case "$TARGET" in
+    docker|native) ;;
+    *) die "unrecognized --target='$TARGET' -- must be 'docker' or 'native'" ;;
+  esac
+
   require_root
   check_os
   check_existing_install
   require_cmd curl
   require_cmd git
 
-  install_docker
+  if [ "$TARGET" = "docker" ]; then
+    install_docker
+  fi
   require_cmd gpg
   require_cmd ssh-keygen
   require_cmd openssl
@@ -667,7 +830,19 @@ main() {
   setup_csf_and_hostagent
 
   write_env_file
-  bring_up_panel
+
+  if [ "$TARGET" = "native" ]; then
+    # Sourced from the just-fetched, just-signature-verified release
+    # checkout (not from wherever this install.sh itself happened to run
+    # from -- curl | bash means there may be no local file for that at
+    # all) -- see scripts/lib/native-install.sh's own header comment.
+    # shellcheck source=/dev/null
+    source "$WBK_INSTALL_DIR/scripts/lib/native-install.sh"
+    run_native_install
+  else
+    bring_up_panel
+  fi
+
   wait_for_health
   print_summary
 }
