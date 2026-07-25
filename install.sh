@@ -946,6 +946,20 @@ main() {
   esac
 
   require_root
+  # fetch_release() below does `rm -rf "$WBK_INSTALL_DIR"` (/opt/wbk by
+  # default) immediately before every clone, including every --force
+  # reinstall. Confirmed for real: an operator whose shell happened to be
+  # sitting inside /opt/wbk (or any subdirectory of it, e.g. after using
+  # `wbk admin reset-password` or just poking around) at the moment that
+  # rm -rf ran got a real, reproducible failure on every command afterward
+  # -- "getcwd() failed: No such file or directory" / "fatal: Unable to
+  # read current working directory" -- since the process's own working
+  # directory no longer existed on disk. Nothing in this script depends on
+  # the invoker's original CWD (verified: no relative-path reads anywhere
+  # in it), so unconditionally moving off of whatever it was, before
+  # anything below can possibly delete it, costs nothing and closes this
+  # off entirely.
+  cd /
   setup_logging
   check_os
   check_existing_install
