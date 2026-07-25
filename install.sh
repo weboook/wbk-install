@@ -462,6 +462,15 @@ CSF_SETUP_FAILED=0
 # including once when .env WAS freshly regenerated -- the first fix here
 # (keyed off .env reuse) covered only one of the two ways this happens.
 ADMIN_ALREADY_EXISTS=0
+# Set by install_csf() when it leaves TESTING mode on (the ACCEPT-rule
+# check failed) -- print_summary()'s own "Firewall:" line used to check
+# only "is csf installed", never whether it actually finished configuring,
+# so it claimed "CSF active" even on a run that had JUST printed a warning
+# that it was leaving CSF in TESTING mode. install_csf() itself still
+# returns success in that case (hostagent setup should still proceed
+# either way), so CSF_SETUP_FAILED alone can't distinguish this from a
+# genuinely healthy CSF.
+CSF_TESTING_MODE_LEFT_ON=0
 
 detect_public_ip() {
   curl -fsSL --max-time 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true
@@ -662,6 +671,17 @@ install_csf() {
 
   info "applying CSF ruleset (testing mode: auto-reverts in 5 minutes if this script never gets here)"
   csf -r >/dev/null
+  # Confirmed for real: a `csf -l` run IMMEDIATELY after `csf -r` returns
+  # can still observe a ruleset missing rules that a SECOND `csf -l` call,
+  # moments later, does see -- e.g. this exact SSH-port ACCEPT rule,
+  # present in a diagnostic dump captured only a few lines further down
+  # the same run that failed to see it here. `csf -r` returning is
+  # apparently not a hard guarantee the kernel's netfilter tables are
+  # already fully settled by the time it hands control back. A short,
+  # fixed sleep is a blunt fix, but a correct one for a settling-time
+  # race like this -- there's no CSF-provided "wait until truly applied"
+  # signal to poll instead.
+  sleep 2
 
   # Real local sanity check before trusting the ruleset enough to drop
   # testing mode: confirm the SSH port we just allow-listed actually shows
@@ -694,6 +714,7 @@ install_csf() {
     # 5-minute window.
     warn "csf -l at the moment of this check (for later diagnosis, before the 5-minute revert):"
     csf -l 2>&1 | sed 's/^/    /' >&2
+    CSF_TESTING_MODE_LEFT_ON=1
     return
   fi
 
@@ -957,7 +978,11 @@ print_summary() {
     fi
   fi
   echo >&2
-  if [ "$SKIP_CSF" != "1" ] && command -v csf >/dev/null 2>&1; then
+  if [ "$SKIP_CSF" != "1" ] && [ "$CSF_TESTING_MODE_LEFT_ON" = "1" ]; then
+    echo " Firewall: CSF installed but still in TESTING mode (see warnings above" >&2
+    echo "           -- ruleset auto-reverts within 5 minutes of this run)." >&2
+    echo "           Re-run this installer to retry, or check /etc/csf/csf.conf by hand." >&2
+  elif [ "$SKIP_CSF" != "1" ] && command -v csf >/dev/null 2>&1; then
     echo " Firewall: CSF active, managed from Settings -> Firewall in the panel" >&2
   elif [ "$CSF_SETUP_FAILED" = "1" ]; then
     echo " Firewall: CSF setup FAILED (see warnings above) -- panel is up regardless." >&2
