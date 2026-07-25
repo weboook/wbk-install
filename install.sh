@@ -37,7 +37,19 @@ set -euo pipefail
 
 WBK_INSTALL_DIR="${WBK_INSTALL_DIR:-/opt/wbk}"
 WBK_HOSTAGENT_DIR="/opt/wbk-hostagent"
-WBK_DEPLOY_KEY_PATH="/opt/wbk/deploy_key"
+# Deliberately NOT under $WBK_INSTALL_DIR: fetch_release() below does
+# `rm -rf "$WBK_INSTALL_DIR"` immediately before every clone (including
+# re-fetches on a --force reinstall), which would delete the deploy key
+# out from under itself the moment it was nested inside that directory --
+# reproduced for real (a genuine install failure: the key existed long
+# enough for latest_release_tag()'s `git ls-remote` to succeed, then
+# vanished before fetch_release()'s own `git clone` needed it a few lines
+# later, "Identity file ... not accessible: No such file or directory").
+# A separate, dedicated directory that install/reinstall never wipes fixes
+# it, and as a side benefit means the key now genuinely survives a
+# --force reinstall without needing any special-case handling for it the
+# way write_env_file()'s ENV_BACKUP dance does for .env.
+WBK_DEPLOY_KEY_PATH="/opt/wbk-secrets/deploy_key"
 DEFAULT_REPO_URL="git@github.com:weboook/wbk.git"
 DEFAULT_RELEASE_CHANNEL="v*"
 
