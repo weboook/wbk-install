@@ -229,6 +229,27 @@ require_root() {
   fi
 }
 
+LOG_FILE=""
+
+# Duplicates every subsequent line of this script's own output (stdout AND
+# stderr -- info/warn/die all print to stderr, and apt/curl/systemctl mix
+# both) to a real file, so a real run's full transcript survives after the
+# terminal scrolls away or the session ends -- exactly the output that's
+# been needed, in full, to diagnose every real bug found running this
+# against an actual server so far. `tee -a` rather than `>` alone: keeps
+# the live terminal output identical to running without this at all,
+# logging is additive, not a replacement for interactive feedback. Every
+# line already carries this script's own `==>`/`  !`/`  X` prefix
+# (info/warn/die), so pulling out just the warnings/errors from a saved
+# log later is one grep: `grep -E '^ *[!X] ' <logfile>`.
+setup_logging() {
+  local log_dir="/var/log/wbk-install"
+  mkdir -p "$log_dir" 2>/dev/null || return
+  LOG_FILE="$log_dir/install-$(date -u +%Y%m%dT%H%M%SZ).log"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+  info "logging full output to $LOG_FILE"
+}
+
 check_os() {
   if [ ! -r /etc/os-release ]; then
     warn "could not read /etc/os-release to detect the host OS"
@@ -844,9 +865,17 @@ print_summary() {
     echo "           Re-run this installer to retry (everything else is left" >&2
     echo "           untouched), or install CSF by hand." >&2
   fi
+  if [ "$TARGET" = "native" ] && command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet pdns; then
+    echo " DNS:      pdns.service is NOT running -- DNS features are unavailable." >&2
+    echo "           journalctl -xeu pdns.service (a port 53 conflict with" >&2
+    echo "           systemd-resolved is the most common cause)." >&2
+  fi
   echo " Install:  $WBK_INSTALL_DIR (.env holds every generated secret)" >&2
   echo " Updates:  Settings -> Updates in the panel from here on (git + this" >&2
   echo "           same deploy key, no more manual steps)." >&2
+  if [ -n "$LOG_FILE" ]; then
+    echo " Log:      $LOG_FILE (full transcript of this run)" >&2
+  fi
   echo "==================================================================" >&2
 }
 
@@ -861,6 +890,7 @@ main() {
   esac
 
   require_root
+  setup_logging
   check_os
   check_existing_install
   require_cmd curl
