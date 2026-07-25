@@ -2,7 +2,14 @@
 #
 # WBK Panel installer.
 #
-#   curl -fsSL https://get.wbk.example/install.sh | sudo bash
+#   curl -fsSL https://weboook.github.io/wbk-install/install.sh | sudo bash
+#
+# This file's canonical copy lives in the private weboook/wbk repo
+# (this exact path); it's kept in sync by hand into the small, separate
+# PUBLIC weboook/wbk-install repo (GitHub Pages, served from that repo's
+# main branch root) whenever it changes here -- see
+# docs/architecture/installation.md for why a separate public repo, not
+# this private one, serves the actual public URL.
 #
 # Contains no proprietary code -- this file only orchestrates: it installs
 # Docker, generates a read-only GitHub deploy key, fetches a GPG-signed
