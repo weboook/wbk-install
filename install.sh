@@ -375,12 +375,22 @@ fetch_release() {
 verify_release_signature() {
   local tag="$1" dest="$2" gnupg_home
   gnupg_home="$(mktemp -d)"
-  trap 'rm -rf "$gnupg_home"' RETURN
+  # NOT `trap ... RETURN`: confirmed for real that a bash RETURN trap set
+  # inside a function is NOT function-scoped -- it stays registered as the
+  # script-wide RETURN trap for every function return for the REST of the
+  # script's execution, not just this function's own return. Reproduced
+  # live: this crashed with "gnupg_home: unbound variable" deep inside
+  # scripts/lib/native-install.sh's own functions, long after this
+  # function's `local gnupg_home` had gone out of scope entirely -- the
+  # leaked trap fired on THEIR return, not this function's. Plain
+  # unconditional cleanup on both exit paths instead.
   printf '%s\n' "$WBK_RELEASE_SIGNING_PUBKEY" | gpg --homedir "$gnupg_home" --batch --quiet --import - 2>/dev/null
 
   if ! GNUPGHOME="$gnupg_home" git -C "$dest" tag -v "$tag" >/dev/null 2>&1; then
+    rm -rf "$gnupg_home"
     die "GPG signature verification FAILED for tag '$tag' -- refusing to install an unsigned/wrongly-signed release"
   fi
+  rm -rf "$gnupg_home"
   info "GPG signature verified for $tag"
 }
 
@@ -606,7 +616,16 @@ install_csf() {
   # box is reachable from the outside -- only testing mode's own 5-minute
   # auto-revert is a real guarantee of that -- but it does catch a broken
   # substitution before ever disabling the safety net that covers the rest.
-  if ! csf -l 2>/dev/null | grep -Eq "dport ${ssh_port}[[:space:]].*ACCEPT|ACCEPT.*dport ${ssh_port}([[:space:]]|$)"; then
+  #
+  # Matches real `csf -l` output confirmed on a live Ubuntu 24.04 box
+  # running CSF 15.10 (iptables-nft backend):
+  #   ...ACCEPT     6    --  !lo    *       0.0.0.0/0    0.0.0.0/0    ctstate NEW tcp dpt:22
+  # i.e. `dpt:PORT` (colon, no space) -- the original pattern here assumed
+  # `dport PORT` (space, no colon), which never matches this format at all,
+  # so this check always failed and silently left CSF in TESTING mode on
+  # every real run. Also matches a `-m multiport --dports a,b,c` style rule
+  # in case CSF ever renders the SSH port that way instead of its own line.
+  if ! csf -l 2>/dev/null | grep -Eq "ACCEPT.*(dpt:${ssh_port}([[:space:]]|$)|dports?[[:space:]][0-9,:]*\b${ssh_port}\b)"; then
     warn "could not confirm an ACCEPT rule for SSH port $ssh_port in the applied ruleset"
     warn "leaving CSF in TESTING mode -- it will auto-revert in 5 minutes; check /etc/csf/csf.conf's TCP_IN by hand"
     return
