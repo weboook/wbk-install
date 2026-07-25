@@ -498,6 +498,11 @@ configure_access() {
     [ -n "$PANEL_DOMAIN" ] || die "a domain is required in domain mode"
     local detected_ip
     detected_ip="$(detect_public_ip)"
+    # Seeded into Settings -> General (server_ip/nameservers) below by
+    # seed_update_config -- this is the exact IP the DNS instructions just
+    # printed, so Settings should already reflect it rather than showing an
+    # empty field the operator has to re-enter by hand.
+    PANEL_IP="$detected_ip"
     echo >&2
     info "add these DNS records at your domain's registrar/DNS provider before continuing:"
     cat >&2 <<EOF
