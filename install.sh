@@ -643,6 +643,23 @@ ensure_python_venv_support() {
   fi
 }
 
+# `[ -d "$path" ]` alone is NOT a safe "already set up" check here: Python's
+# venv module creates the target directory FIRST, then fails partway
+# through if ensurepip is missing (see ensure_python_venv_support's own
+# comment) -- confirmed for real that a `--force` re-run after exactly that
+# failure left a broken, pip-less venv directory behind, and this exact
+# `[ ! -d ... ] || python3 -m venv ...` idiom then treated that broken
+# directory as "already installed" and skipped recreating it, failing later
+# with "venv/bin/pip: No such file or directory" instead. Checks for
+# `bin/pip` (the actual thing every caller needs) rather than the directory
+# itself, and removes+recreates on anything short of that.
+ensure_venv() {
+  local venv_path="$1"
+  [ -x "$venv_path/bin/pip" ] && return
+  rm -rf "$venv_path"
+  python3 -m venv "$venv_path"
+}
+
 install_hostagent() {
   info "setting up wbk-hostagent"
   mkdir -p "$WBK_HOSTAGENT_DIR/app"
@@ -651,9 +668,7 @@ install_hostagent() {
   cp -a "$WBK_INSTALL_DIR/shared" "$WBK_HOSTAGENT_DIR/app/shared"
 
   ensure_python_venv_support
-  if [ ! -d "$WBK_HOSTAGENT_DIR/venv" ]; then
-    python3 -m venv "$WBK_HOSTAGENT_DIR/venv"
-  fi
+  ensure_venv "$WBK_HOSTAGENT_DIR/venv"
   "$WBK_HOSTAGENT_DIR/venv/bin/pip" install --quiet --upgrade pip
   "$WBK_HOSTAGENT_DIR/venv/bin/pip" install --quiet -r "$WBK_INSTALL_DIR/services/hostagent/requirements.txt"
 
