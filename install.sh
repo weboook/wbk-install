@@ -415,6 +415,27 @@ verify_release_signature() {
   info "GPG signature verified for $tag"
 }
 
+# services/cli/wbk always runs on THIS host regardless of target -- even on
+# --target=docker, it needs `docker`/`docker compose` and this install's own
+# docker-compose.yml, none of which exist inside the container itself (see
+# docs/cli.md and the CLI's own module docstring for the full design). A
+# symlink, not a copy, so a future self-update's directory-swap (which
+# replaces $WBK_INSTALL_DIR/services wholesale, not this path) picks up a
+# newer wbk automatically without install.sh ever having to re-run this step.
+install_wbk_cli() {
+  # Guards against a release tag older than the CLI itself (this function's
+  # own call site ships in install.sh, which is live at the public URL the
+  # instant it's pushed -- the release TAG it then fetches can still lag
+  # behind until a new one is cut, same two-step release process every
+  # other fix this session needed).
+  if [ ! -f "$WBK_INSTALL_DIR/services/cli/wbk" ]; then
+    warn "this release predates the wbk CLI -- skipping (re-run after a newer release is tagged)"
+    return
+  fi
+  chmod +x "$WBK_INSTALL_DIR/services/cli/wbk"
+  ln -sf "$WBK_INSTALL_DIR/services/cli/wbk" /usr/local/bin/wbk
+}
+
 # ---------------------------------------------------------------------------
 # Interactive configuration
 # ---------------------------------------------------------------------------
@@ -428,6 +449,19 @@ PANEL_HOST_PORT="8080"
 TENANT_HOST_PORT="8090"
 ENV_BACKUP=""
 CSF_SETUP_FAILED=0
+# Set by write_env_file() when it finds and reuses an existing .env --
+# print_summary() uses this to stop claiming the freshly-prompted/generated
+# ADMIN_PASSWORD is what actually got applied. It never is on that path:
+# admin bootstrap (services/api/app/main.py) only ever creates the FIRST
+# admin row, on first boot when none exists yet -- a --force reinstall
+# reuses the same persistent database (that's the whole point of the
+# code-root/data-root split, see docs/architecture/native-deployment.md),
+# so the real admin account and its real password are still whatever was
+# set on the box's very first install, regardless of what this run
+# prompted for or generated. Confirmed for real: a user hit exactly this,
+# the printed "generated" password didn't work, because it was never
+# applied to begin with.
+EXISTING_INSTALL_REUSED=0
 
 detect_public_ip() {
   curl -fsSL --max-time 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true
@@ -749,6 +783,7 @@ write_env_file() {
     cp "$ENV_BACKUP" "$WBK_INSTALL_DIR/.env"
     chmod 600 "$WBK_INSTALL_DIR/.env"
     rm -f "$ENV_BACKUP"
+    EXISTING_INSTALL_REUSED=1
     return
   fi
 
@@ -851,11 +886,17 @@ print_summary() {
   echo " WBK Panel is up" >&2
   echo "==================================================================" >&2
   echo " URL:      $url" >&2
-  echo " Login:    $ADMIN_EMAIL" >&2
-  if [ "$ADMIN_PASSWORD_GENERATED" = "1" ]; then
-    echo " Password: $ADMIN_PASSWORD   (generated -- shown once, save it now)" >&2
+  if [ "$EXISTING_INSTALL_REUSED" = "1" ]; then
+    echo " Login:    unchanged -- this reinstall reused your existing admin account" >&2
+    echo "           and database (the email/password just prompted for were NOT" >&2
+    echo "           applied). Lost the original? sudo wbk admin reset-password <email>" >&2
   else
-    echo " Password: (the one you entered)" >&2
+    echo " Login:    $ADMIN_EMAIL" >&2
+    if [ "$ADMIN_PASSWORD_GENERATED" = "1" ]; then
+      echo " Password: $ADMIN_PASSWORD   (generated -- shown once, save it now)" >&2
+    else
+      echo " Password: (the one you entered)" >&2
+    fi
   fi
   echo >&2
   if [ "$SKIP_CSF" != "1" ] && command -v csf >/dev/null 2>&1; then
@@ -873,6 +914,9 @@ print_summary() {
   echo " Install:  $WBK_INSTALL_DIR (.env holds every generated secret)" >&2
   echo " Updates:  Settings -> Updates in the panel from here on (git + this" >&2
   echo "           same deploy key, no more manual steps)." >&2
+  if command -v wbk >/dev/null 2>&1; then
+    echo " CLI:      wbk status | wbk doctor | sudo wbk login  (see docs/cli.md)" >&2
+  fi
   if [ -n "$LOG_FILE" ]; then
     echo " Log:      $LOG_FILE (full transcript of this run)" >&2
   fi
@@ -913,6 +957,7 @@ main() {
 
   fetch_release "$tag" "$WBK_INSTALL_DIR"
   verify_release_signature "$tag" "$WBK_INSTALL_DIR"
+  install_wbk_cli
 
   configure_access
   configure_admin
