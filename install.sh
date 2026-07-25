@@ -617,6 +617,32 @@ install_csf() {
   info "CSF active (testing mode off)"
 }
 
+# A fresh Ubuntu cloud image ships bare `python3` with no venv/ensurepip
+# support at all -- `python3-venv` is not installed by default. Confirmed
+# for real on a fresh Ubuntu 24.04.4 install: `python3 -m venv` failed with
+# "ensurepip is not available" even after this script's own base-package
+# apt installs (the plain `python3-venv` metapackage alone didn't pull in
+# ensurepip either) -- the error message itself names the fix,
+# `python3.12-venv`, so this queries the actually-running python3's own
+# version rather than hardcoding a release-specific package name. Called
+# before every `python3 -m venv` in this script (both here and in
+# scripts/lib/native-install.sh, which sources this file's functions).
+# Idempotent -- the ensurepip check makes every call after the first a
+# fast no-op.
+ensure_python_venv_support() {
+  python3 -c "import ensurepip" >/dev/null 2>&1 && return
+  info "installing python3-venv (ensurepip support missing on this host)"
+  local py_minor
+  py_minor="$(python3 -c 'import sys; print(sys.version_info.minor)' 2>/dev/null || true)"
+  apt-get update -qq
+  if [ -n "$py_minor" ]; then
+    apt-get install -y -qq --no-install-recommends "python3.${py_minor}-venv" python3-venv \
+      || apt-get install -y -qq --no-install-recommends python3-venv
+  else
+    apt-get install -y -qq --no-install-recommends python3-venv
+  fi
+}
+
 install_hostagent() {
   info "setting up wbk-hostagent"
   mkdir -p "$WBK_HOSTAGENT_DIR/app"
@@ -624,6 +650,7 @@ install_hostagent() {
   cp -a "$WBK_INSTALL_DIR/services/hostagent/wbk_hostagent" "$WBK_HOSTAGENT_DIR/app/wbk_hostagent"
   cp -a "$WBK_INSTALL_DIR/shared" "$WBK_HOSTAGENT_DIR/app/shared"
 
+  ensure_python_venv_support
   if [ ! -d "$WBK_HOSTAGENT_DIR/venv" ]; then
     python3 -m venv "$WBK_HOSTAGENT_DIR/venv"
   fi
