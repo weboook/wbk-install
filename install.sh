@@ -825,9 +825,21 @@ WBK_SERVICE_MANAGER=systemd
 DATABASE_URL=sqlite:///${WBK_DATA_ROOT_NATIVE}/wbk.db
 BACKUP_STAGING_DIR=${WBK_DATA_ROOT_NATIVE}/backup-staging
 TICKET_ATTACHMENTS_DIR=${WBK_DATA_ROOT_NATIVE}/ticket-attachments
-UPDATES_DEPLOY_KEY_PATH=${WBK_DATA_ROOT_NATIVE}/updates/deploy_key
+UPDATES_DEPLOY_KEY_PATH=${WBK_DEPLOY_KEY_PATH}
 RELEASE_SIGNING_PUBKEY_PATH=${WBK_INSTALL_DIR}/configs/updates/release-signing-key.asc
 EOF
+    # UPDATES_DEPLOY_KEY_PATH above deliberately points at the SAME key
+    # setup_deploy_key() already generated and the operator already
+    # registered as a GitHub deploy key -- not a second, separately
+    # lazily-generated one (app.modules.updates.deploy_key's
+    # ensure_deploy_key() only generates a fresh key if none exists yet at
+    # this path, so pointing it here means it finds this one and reuses it
+    # instead). That file is root-owned 0600 (setup_deploy_key runs as
+    # root); wbk-api.service runs as the unprivileged `wbk` user, so it
+    # can't read it as-is. scripts/lib/native-install.sh's
+    # secure_deploy_key_for_native() re-owns it to wbk:wbk once that
+    # account exists -- can't be done here, this runs before
+    # create_native_accounts().
   fi
 
   chmod 600 "$WBK_INSTALL_DIR/.env"
