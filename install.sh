@@ -676,17 +676,6 @@ install_csf() {
 
   info "applying CSF ruleset (testing mode: auto-reverts in 5 minutes if this script never gets here)"
   csf -r >/dev/null
-  # Confirmed for real: a `csf -l` run IMMEDIATELY after `csf -r` returns
-  # can still observe a ruleset missing rules that a SECOND `csf -l` call,
-  # moments later, does see -- e.g. this exact SSH-port ACCEPT rule,
-  # present in a diagnostic dump captured only a few lines further down
-  # the same run that failed to see it here. `csf -r` returning is
-  # apparently not a hard guarantee the kernel's netfilter tables are
-  # already fully settled by the time it hands control back. A short,
-  # fixed sleep is a blunt fix, but a correct one for a settling-time
-  # race like this -- there's no CSF-provided "wait until truly applied"
-  # signal to poll instead.
-  sleep 2
 
   # Real local sanity check before trusting the ruleset enough to drop
   # testing mode: confirm the SSH port we just allow-listed actually shows
@@ -705,7 +694,29 @@ install_csf() {
   # so this check always failed and silently left CSF in TESTING mode on
   # every real run. Also matches a `-m multiport --dports a,b,c` style rule
   # in case CSF ever renders the SSH port that way instead of its own line.
-  if ! csf -l 2>/dev/null | grep -Eq "ACCEPT.*(dpt:${ssh_port}([[:space:]]|$)|dports?[[:space:]][0-9,:]*\b${ssh_port}\b)"; then
+  #
+  # Confirmed for real on a live box: a `csf -l` run immediately after
+  # `csf -r` returns can still observe a ruleset missing rules that a
+  # SECOND `csf -l` call, moments later, does see -- e.g. this exact
+  # SSH-port ACCEPT rule, present in a diagnostic dump captured only a few
+  # seconds after a run whose single, fixed-2-second-sleep check failed to
+  # see it. `csf -r` returning is apparently not a hard guarantee the
+  # kernel's netfilter tables are already fully settled by the time it
+  # hands control back, and a single fixed sleep just moves the race rather
+  # than closing it. Retrying the check itself (up to 10s total) is the
+  # correct fix -- there's no CSF-provided "wait until truly applied"
+  # signal to poll instead, so polling `csf -l` directly is the closest
+  # equivalent.
+  local ssh_rule_confirmed=0 attempt
+  for attempt in 1 2 3 4 5; do
+    if csf -l 2>/dev/null | grep -Eq "ACCEPT.*(dpt:${ssh_port}([[:space:]]|$)|dports?[[:space:]][0-9,:]*\b${ssh_port}\b)"; then
+      ssh_rule_confirmed=1
+      break
+    fi
+    sleep 2
+  done
+
+  if [ "$ssh_rule_confirmed" -eq 0 ]; then
     warn "could not confirm an ACCEPT rule for SSH port $ssh_port in the applied ruleset"
     warn "leaving CSF in TESTING mode -- it will auto-revert in 5 minutes; check /etc/csf/csf.conf's TCP_IN by hand"
     # Dump the actual ruleset RIGHT NOW, into this run's own log (see
