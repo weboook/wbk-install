@@ -683,6 +683,17 @@ install_csf() {
   if ! csf -l 2>/dev/null | grep -Eq "ACCEPT.*(dpt:${ssh_port}([[:space:]]|$)|dports?[[:space:]][0-9,:]*\b${ssh_port}\b)"; then
     warn "could not confirm an ACCEPT rule for SSH port $ssh_port in the applied ruleset"
     warn "leaving CSF in TESTING mode -- it will auto-revert in 5 minutes; check /etc/csf/csf.conf's TCP_IN by hand"
+    # Dump the actual ruleset RIGHT NOW, into this run's own log (see
+    # setup_logging) -- CSF's own testing-mode watchdog reverts to
+    # whatever ruleset existed before this run within 5 minutes, so asking
+    # an operator to go check `csf -l` by hand after the fact means
+    # they're very likely looking at an already-reverted, unrelated
+    # snapshot instead of the one this check actually evaluated (confirmed
+    # for real: exactly this happened once already). This makes the next
+    # failure self-diagnosing from the log alone, no more racing the
+    # 5-minute window.
+    warn "csf -l at the moment of this check (for later diagnosis, before the 5-minute revert):"
+    csf -l 2>&1 | sed 's/^/    /' >&2
     return
   fi
 
