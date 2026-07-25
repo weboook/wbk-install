@@ -449,19 +449,19 @@ PANEL_HOST_PORT="8080"
 TENANT_HOST_PORT="8090"
 ENV_BACKUP=""
 CSF_SETUP_FAILED=0
-# Set by write_env_file() when it finds and reuses an existing .env --
-# print_summary() uses this to stop claiming the freshly-prompted/generated
-# ADMIN_PASSWORD is what actually got applied. It never is on that path:
-# admin bootstrap (services/api/app/main.py) only ever creates the FIRST
-# admin row, on first boot when none exists yet -- a --force reinstall
-# reuses the same persistent database (that's the whole point of the
-# code-root/data-root split, see docs/architecture/native-deployment.md),
-# so the real admin account and its real password are still whatever was
-# set on the box's very first install, regardless of what this run
-# prompted for or generated. Confirmed for real: a user hit exactly this,
-# the printed "generated" password didn't work, because it was never
-# applied to begin with.
-EXISTING_INSTALL_REUSED=0
+# Set by check_admin_already_exists() (called after the panel is up, right
+# before print_summary()) -- a direct query against the real, persistent
+# database, NOT inferred from whether .env happened to be reused. Those are
+# two independent things: admin bootstrap (services/api/app/main.py) only
+# ever creates the FIRST admin row, on first boot when none exists yet, and
+# the persistent database survives every --force reinstall regardless of
+# whether THIS run's .env happened to be fresh or reused (a prior run's
+# crash could leave .env missing/regenerated even though the database, and
+# therefore the real admin account, is untouched). Confirmed for real,
+# twice: a user's printed "generated" password didn't work both times,
+# including once when .env WAS freshly regenerated -- the first fix here
+# (keyed off .env reuse) covered only one of the two ways this happens.
+ADMIN_ALREADY_EXISTS=0
 
 detect_public_ip() {
   curl -fsSL --max-time 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true
@@ -783,7 +783,6 @@ write_env_file() {
     cp "$ENV_BACKUP" "$WBK_INSTALL_DIR/.env"
     chmod 600 "$WBK_INSTALL_DIR/.env"
     rm -f "$ENV_BACKUP"
-    EXISTING_INSTALL_REUSED=1
     return
   fi
 
@@ -885,6 +884,42 @@ wait_for_health() {
   fi
 }
 
+_ADMIN_COUNT_SCRIPT='
+from app.db.session import SessionLocal
+from app.db.models import AdminUser
+db = SessionLocal()
+print(db.query(AdminUser).count())
+'
+
+# Direct DB query, run after the panel is confirmed healthy (so migrations
+# have definitely already applied and the table definitely exists) -- see
+# ADMIN_ALREADY_EXISTS's own comment above for why this has to be a real
+# query rather than inferred from .env. Never fatal: a query failure just
+# leaves ADMIN_ALREADY_EXISTS at its default (0), which only affects
+# print_summary()'s wording, not anything that actually matters functionally.
+check_admin_already_exists() {
+  local count script_path
+  if [ "$TARGET" = "native" ]; then
+    script_path="$(mktemp --suffix=.py)"
+    printf '%s' "$_ADMIN_COUNT_SCRIPT" > "$script_path"
+    chmod 644 "$script_path"
+    count="$(su -s /bin/bash wbk -c "cd $WBK_INSTALL_DIR/services/api && \
+      PYTHONPATH=$WBK_INSTALL_DIR/services/api:$WBK_INSTALL_DIR \
+      DATABASE_URL=sqlite:///$WBK_DATA_ROOT_NATIVE/wbk.db \
+      $WBK_INSTALL_DIR/venv-api/bin/python $script_path" 2>/dev/null | tail -n1)"
+    rm -f "$script_path"
+  else
+    local cid
+    cid="$(cd "$WBK_INSTALL_DIR" && docker compose ps -q wbk 2>/dev/null)"
+    [ -n "$cid" ] || return
+    count="$(docker exec -e PYTHONPATH=/app/services/api:/app "$cid" \
+      python3 -c "$_ADMIN_COUNT_SCRIPT" 2>/dev/null | tail -n1)"
+  fi
+  if [ -n "$count" ] && [ "$count" -gt 0 ] 2>/dev/null; then
+    ADMIN_ALREADY_EXISTS=1
+  fi
+}
+
 print_summary() {
   local url
   if [ -n "$PANEL_DOMAIN" ]; then
@@ -898,10 +933,10 @@ print_summary() {
   echo " WBK Panel is up" >&2
   echo "==================================================================" >&2
   echo " URL:      $url" >&2
-  if [ "$EXISTING_INSTALL_REUSED" = "1" ]; then
-    echo " Login:    unchanged -- this reinstall reused your existing admin account" >&2
-    echo "           and database (the email/password just prompted for were NOT" >&2
-    echo "           applied). Lost the original? sudo wbk admin reset-password <email>" >&2
+  if [ "$ADMIN_ALREADY_EXISTS" = "1" ]; then
+    echo " Login:    unchanged -- an admin account already existed in this box's" >&2
+    echo "           persistent database (the email/password just prompted for" >&2
+    echo "           were NOT applied). Lost it? sudo wbk admin reset-password <email>" >&2
   else
     echo " Login:    $ADMIN_EMAIL" >&2
     if [ "$ADMIN_PASSWORD_GENERATED" = "1" ]; then
@@ -1006,6 +1041,7 @@ main() {
   fi
 
   wait_for_health
+  check_admin_already_exists
   print_summary
 }
 
