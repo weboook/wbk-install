@@ -206,6 +206,11 @@ Usage: install.sh [options]
   --force-unsupported-os   Continue on a host OS other than Ubuntu 22.04/24.04.
   --unattended             Never prompt; use flags/env vars/defaults only.
   --skip-csf               Skip CSF + wbk-hostagent setup entirely.
+  --skip-mail              No mail server. On --target=native nothing mail-
+                           related is installed at all; on --target=docker
+                           (where Postfix/Dovecot are always in the image) it
+                           means the firewall never opens SMTP/IMAP, leaving
+                           them container-internal and unreachable.
   --repo=URL               Override the default panel repo SSH URL.
   --channel=GLOB           Release tag glob to install (default: v*).
   --target=docker|native   Deployment target (default: docker). native installs
@@ -218,7 +223,11 @@ Environment overrides (for --unattended use):
   WBK_DEPLOY_KEY_PRIVATE (required if WBK_DEPLOY_KEY_MODE=paste),
   WBK_CSF_SOURCE_REPO (GitHub "owner/repo" to fetch CSF from, default
   Aetherinox/csf-firewall -- override if that source ever goes away too),
-  WBK_TARGET (docker|native, same as --target)
+  WBK_TARGET (docker|native, same as --target),
+  WBK_WEBMAIL_REPO_URL / WBK_WEBMAIL_REPO_REF (the webmail fork to install and
+  the tag/commit to pin it to; both empty by default, in which case webmail is
+  simply not provisioned and /webmail/ serves a "not configured" page, leaving
+  the rest of the mail server unaffected. See configs/versions.env.)
 EOF
       exit 0
       ;;
@@ -571,6 +580,47 @@ configure_ports() {
   prompt TENANT_HOST_PORT "Host port for tenant sites (use 80 on a dedicated server)" "${WBK_TENANT_HOST_PORT:-8090}"
 }
 
+# Whether this install runs a mail server at all. Resolved exactly ONCE and
+# cached, because the answer is needed in two places that are far apart in
+# main()'s own flow (the CSF ruleset, i.e. which ports to open, and on the
+# native target the mail install steps themselves), and must never re-prompt.
+#
+# Deliberately lives here rather than in scripts/lib/native-install.sh (whose
+# want_native_mail() now just delegates to this): setup_csf_and_hostagent runs
+# BEFORE that file is ever sourced, and opening SMTP/IMAP ports on a box that
+# will not run a mail server, or refusing to open them on one that will, are
+# both real misconfigurations.
+#
+# The Docker target has no mail opt-out of its own (the image always ships
+# Postfix/Dovecot and supervisord always starts them), so --skip-mail there
+# means exactly one thing: the firewall never opens the mail ports, leaving
+# those daemons container-internal and unreachable. That IS the effective
+# opt-out on that target; documented in --help rather than pretended otherwise.
+_WANT_MAIL_RESOLVED=""
+want_mail() {
+  if [ -n "$_WANT_MAIL_RESOLVED" ]; then
+    [ "$_WANT_MAIL_RESOLVED" = "yes" ]
+    return
+  fi
+  if [ "$SKIP_MAIL" = "1" ]; then
+    _WANT_MAIL_RESOLVED="no"
+    info "mail server disabled (--skip-mail): SMTP/IMAP ports stay closed"
+    return 1
+  fi
+  if [ "$TARGET" = "docker" ]; then
+    # Nothing to ask: the image itself always contains and starts them.
+    _WANT_MAIL_RESOLVED="yes"
+    return 0
+  fi
+  if confirm "Install the mail server (Postfix, Dovecot, webmail) for hosting email on this box"; then
+    _WANT_MAIL_RESOLVED="yes"
+    return 0
+  fi
+  _WANT_MAIL_RESOLVED="no"
+  info "skipping the mail server at your request"
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # CSF + wbk-hostagent (host-level, see docs/architecture/csf-firewall.md)
 # ---------------------------------------------------------------------------
@@ -641,6 +691,26 @@ fetch_and_verify_csf() {
   fi
 }
 
+# csf_add_port <list_var_name> <port>: appends <port> to the comma-separated
+# port list held in <list_var_name>, unless it's already in there. Keeps the
+# derived TCP_IN/TCP_OUT/UDP_IN lists below free of duplicates (e.g. a
+# PANEL_HOST_PORT of 443, or an SSH port of 80) without any caller having to
+# special-case that, and preserves insertion order so the SSH port always
+# stays first. Empty ports are ignored rather than producing ",,": CSF rejects
+# a malformed list outright, which on a remote box means a lockout.
+csf_add_port() {
+  local __var="$1" __port="$2" __current="${!1}"
+  [ -n "$__port" ] || return 0
+  case ",${__current}," in
+    *",${__port},"*) return 0 ;;
+  esac
+  if [ -z "$__current" ]; then
+    printf -v "$__var" '%s' "$__port"
+  else
+    printf -v "$__var" '%s' "${__current},${__port}"
+  fi
+}
+
 install_csf() {
   if command -v csf >/dev/null 2>&1; then
     info "CSF already installed, skipping install (will still reconfigure)"
@@ -670,6 +740,64 @@ install_csf() {
   info "detected SSH port: $ssh_port -- allow-listing it before any restart, so this install can never lock you out"
   csf -a 127.0.0.1 >/dev/null 2>&1 || true
 
+  # --- The port set, DERIVED from what this install actually enabled ---------
+  #
+  # This used to be one hardcoded string: "<ssh>,80,443,<panel>,<tenant>", with
+  # UDP_IN never written at all. Two whole features were unreachable as a
+  # direct result, on every install:
+  #   - DNS: the panel writes NS records and tells tenants to delegate their
+  #     zones here, while 53/tcp AND 53/udp were both blocked. TCP/53 is not
+  #     optional: zone transfers and any answer too large for one UDP
+  #     datagram use it.
+  #   - Mail: 25 (inbound MX), 465/587 (client submission), 143/993 (IMAP)
+  #     were all blocked, so no mail could be sent or received at all.
+  # And TESTING was flipped to "0" right afterwards, making the block permanent.
+  #
+  # The SSH port is added FIRST, and this whole list is still written before the
+  # very first `csf -r` below, so the "never lock the operator out" property is
+  # unchanged. See the ACCEPT-rule sanity check further down, which verifies
+  # that exact port really is allowed in the ruleset CSF applied.
+  local tcp_in="" tcp_out="" udp_in="" mail_port
+  csf_add_port tcp_in "$ssh_port"
+  csf_add_port tcp_in 80
+  csf_add_port tcp_in 443
+  csf_add_port tcp_in "$PANEL_HOST_PORT"
+  csf_add_port tcp_in "$TENANT_HOST_PORT"
+  # PowerDNS is part of every install on both targets (an apt package natively,
+  # a supervisord program in the container, published by docker-compose.yml's
+  # own `ports:`), and the panel's DNS Administration feature is useless without
+  # it being reachable.
+  csf_add_port tcp_in 53
+  csf_add_port udp_in 53
+
+  csf_add_port tcp_out "$ssh_port"
+  # FTP(20/21), DNS(53), HTTP(S), rsync(873) and cPanel-convention ports
+  # 2086/2087/2089/2703 are CSF's own documented outbound defaults, kept as-is
+  # (the duplicated 443 they used to contain is dropped, since csf_add_port
+  # makes any repeat a no-op anyway).
+  for mail_port in 20 21 53 80 443 873 2086 2087 2089 2703; do
+    csf_add_port tcp_out "$mail_port"
+  done
+
+  if want_mail; then
+    # 25 inbound MX, 465 submissions (implicit TLS), 587 submission (STARTTLS),
+    # 143 IMAP+STARTTLS, 993 IMAPS, matching docker-compose.yml's published
+    # ports and configs/postfix/master.cf + configs/dovecot/dovecot.conf's own
+    # listeners exactly.
+    for mail_port in 25 465 587 143 993; do
+      csf_add_port tcp_in "$mail_port"
+    done
+    # Outbound 25 is already in the default set above; 465/587 matter for a
+    # relay/smarthost setup, which is a normal thing for an operator to add
+    # later without wanting to reopen the firewall to do it.
+    for mail_port in 465 587; do
+      csf_add_port tcp_out "$mail_port"
+    done
+    info "opening mail ports (SMTP 25/465/587, IMAP 143/993)"
+  else
+    info "mail ports stay closed (no mail server on this install)"
+  fi
+
   # TESTING=1 first: csf -r under testing mode auto-reverts to the previous
   # ruleset after 5 minutes if this script (or the operator) never confirms
   # it's safe -- the single most important safety property of this step.
@@ -677,8 +805,14 @@ install_csf() {
   # CSF's iptables management fights Docker's own DNAT/FORWARD rules.
   sed -i 's/^TESTING = .*/TESTING = "1"/' /etc/csf/csf.conf
   sed -i 's/^DOCKER = .*/DOCKER = "1"/' /etc/csf/csf.conf
-  sed -i "s/^TCP_IN = .*/TCP_IN = \"${ssh_port},80,443,${PANEL_HOST_PORT},${TENANT_HOST_PORT}\"/" /etc/csf/csf.conf
-  sed -i "s/^TCP_OUT = .*/TCP_OUT = \"${ssh_port},20,21,25,53,80,443,443,873,2086,2087,2089,2703\"/" /etc/csf/csf.conf
+  sed -i "s/^TCP_IN = .*/TCP_IN = \"${tcp_in}\"/" /etc/csf/csf.conf
+  sed -i "s/^TCP_OUT = .*/TCP_OUT = \"${tcp_out}\"/" /etc/csf/csf.conf
+  # UDP_IN was never written before, so whatever the shipped csf.conf happened
+  # to contain governed UDP/53. Written explicitly now, and deliberately narrow:
+  # nothing this panel runs needs any other inbound UDP port.
+  sed -i "s/^UDP_IN = .*/UDP_IN = \"${udp_in}\"/" /etc/csf/csf.conf
+  info "CSF TCP_IN: ${tcp_in}"
+  info "CSF UDP_IN: ${udp_in}"
 
   info "applying CSF ruleset (testing mode: auto-reverts in 5 minutes if this script never gets here)"
   csf -r >/dev/null
@@ -830,6 +964,28 @@ random_secret() {
   openssl rand -base64 "$1" | tr -dc 'A-Za-z0-9' | head -c "$1"
 }
 
+# The FQDN Postfix announces as its own `myhostname`: in EHLO, in smtpd_banner,
+# in Received headers and in bounce envelopes. It has to be a real
+# FQDN: large receivers reject or heavily penalize a non-FQDN, which is exactly
+# what configs/postfix/main.cf.template's old hardcoded `mail.localhost` was.
+# mail.<panel domain> is the conventional choice and matches the per-domain
+# `mail.<domain>` hostnames app.modules.mail.dns_automation already publishes.
+# Empty in IP mode with no real host FQDN, in which case both targets fall back
+# and warn (see docker/entrypoint.sh and render_native_mail_config), rather than
+# silently announcing something a receiver will refuse.
+derive_mail_hostname() {
+  if [ -n "$PANEL_DOMAIN" ]; then
+    echo "mail.${PANEL_DOMAIN}"
+    return
+  fi
+  local fqdn
+  fqdn="$(hostname -f 2>/dev/null || true)"
+  case "$fqdn" in
+    *.*) echo "$fqdn" ;;
+    *) echo "" ;;
+  esac
+}
+
 write_env_file() {
   if [ -n "$ENV_BACKUP" ] && [ -f "$ENV_BACKUP" ]; then
     info "an existing .env was found (reinstall) -- reusing it as-is rather than generating new secrets"
@@ -837,6 +993,15 @@ write_env_file() {
     cp "$ENV_BACKUP" "$WBK_INSTALL_DIR/.env"
     chmod 600 "$WBK_INSTALL_DIR/.env"
     rm -f "$ENV_BACKUP"
+    # A .env written by an installer older than MAIL_HOSTNAME has no such line,
+    # and Postfix would keep announcing a fallback hostname forever. Appending a
+    # single derived, non-secret line is safe here in a way regenerating the file
+    # would not be (that is what destroys FERNET_KEY); an existing value is
+    # never touched.
+    if ! grep -q '^MAIL_HOSTNAME=' "$WBK_INSTALL_DIR/.env"; then
+      printf 'MAIL_HOSTNAME=%s\n' "$(derive_mail_hostname)" >> "$WBK_INSTALL_DIR/.env"
+      info "added MAIL_HOSTNAME to the reused .env (Postfix's own EHLO/banner name)"
+    fi
     return
   fi
 
@@ -859,6 +1024,7 @@ POSTGRES_PROVISIONER_PASSWORD=$(random_secret 32)
 PDNS_API_KEY=$(random_secret 32)
 REDIS_PROVISIONER_PASSWORD=$(random_secret 32)
 MARIADB_MAIL_RO_PASSWORD=$(random_secret 32)
+MAIL_HOSTNAME=$(derive_mail_hostname)
 ACME_USE_STAGING=false
 WEBAUTHN_RP_ID=${rp_id}
 WEBAUTHN_ORIGIN=${origin}
