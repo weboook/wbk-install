@@ -172,6 +172,11 @@ FORCE=0
 FORCE_UNSUPPORTED_OS=0
 UNATTENDED=0
 SKIP_CSF=0
+# Mail (Postfix/Dovecot/OpenDKIM/webmail) is a large, opinionated chunk of a
+# server: it opens SMTP/IMAP ports, installs several daemons, and only earns
+# its keep if this box is actually meant to handle email. Opt out with
+# --skip-mail, or answer no at the prompt (see setup_native_mail's own gate).
+SKIP_MAIL=0
 REPO_URL="${WBK_REPO_URL:-$DEFAULT_REPO_URL}"
 RELEASE_CHANNEL="${WBK_RELEASE_CHANNEL:-$DEFAULT_RELEASE_CHANNEL}"
 DEPLOY_KEY_MODE="${WBK_DEPLOY_KEY_MODE:-generate}"  # generate | paste
@@ -190,6 +195,7 @@ for arg in "$@"; do
     --force-unsupported-os) FORCE_UNSUPPORTED_OS=1 ;;
     --unattended) UNATTENDED=1 ;;
     --skip-csf) SKIP_CSF=1 ;;
+    --skip-mail) SKIP_MAIL=1 ;;
     --repo=*) REPO_URL="${arg#--repo=}" ;;
     --channel=*) RELEASE_CHANNEL="${arg#--channel=}" ;;
     --target=*) TARGET="${arg#--target=}" ;;
