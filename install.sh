@@ -29,6 +29,17 @@
 # `csf -r`, etc). Re-running after a partial failure resumes rather than
 # duplicating work. Refuses to touch an already-running install without
 # --force.
+#
+# On --target=native there is also a narrower, non-interactive way to re-assert
+# just the system configuration this installer owns, without re-running any of
+# the package installs or prompts below:
+#
+#     sudo bash /opt/wbk/scripts/lib/native-install.sh --reconcile
+#
+# That is what a panel self-update runs for itself after swapping in new code
+# (docs/architecture/self-update.md), and what an operator runs to repair a box
+# whose rendered config, grants or systemd drop-ins have drifted from the
+# release it is running.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -1187,6 +1198,12 @@ print_summary() {
   echo " Install:  $WBK_INSTALL_DIR (.env holds every generated secret)" >&2
   echo " Updates:  Settings -> Updates in the panel from here on (git + this" >&2
   echo "           same deploy key, no more manual steps)." >&2
+  if [ "$TARGET" = "native" ]; then
+    echo " Repair:   sudo bash $WBK_INSTALL_DIR/scripts/lib/native-install.sh --reconcile" >&2
+    echo "           re-asserts this box's rendered config, grants and systemd" >&2
+    echo "           drop-ins from the installed release. Installs nothing," >&2
+    echo "           prompts for nothing, safe to run at any time." >&2
+  fi
   if command -v wbk >/dev/null 2>&1; then
     echo " CLI:      wbk status | wbk doctor | sudo wbk login  (see docs/cli.md)" >&2
   fi
