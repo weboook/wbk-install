@@ -244,6 +244,13 @@ Environment overrides (for --unattended use):
 EOF
       exit 0
       ;;
+    *)
+      # No silent fallthrough. Without this an unrecognized flag was accepted
+      # and ignored, so a typo like --skipcsf installed CSF anyway and a script
+      # still passing the removed --target=native looked like it worked. Both
+      # fail loudly now, which is the only way the caller finds out.
+      die "unknown option: $arg (run with --help to see the supported flags)"
+      ;;
   esac
 done
 
