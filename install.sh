@@ -200,6 +200,15 @@ DEPLOY_KEY_MODE="${WBK_DEPLOY_KEY_MODE:-generate}"  # generate | paste
 # when this is "native".
 TARGET="${WBK_TARGET:-docker}"
 
+# DEVELOPMENT ONLY: install from a local working tree instead of a fetched,
+# GPG-verified release tag. Empty by default and gated behind an explicit flag,
+# because it bypasses the single mechanism that authenticates what this script
+# installs: no tag resolution, no clone, no signature check. Everything after
+# staging (write_env_file, run_native_install) is identical either way, which is
+# the point -- a dev VM exercises the real installer against the tree you are
+# editing rather than an image nothing ships. See scripts/dev-vm.sh.
+LOCAL_SOURCE="${WBK_LOCAL_SOURCE:-}"
+
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1 ;;
@@ -210,6 +219,8 @@ for arg in "$@"; do
     --repo=*) REPO_URL="${arg#--repo=}" ;;
     --channel=*) RELEASE_CHANNEL="${arg#--channel=}" ;;
     --target=*) TARGET="${arg#--target=}" ;;
+    --source=local) LOCAL_SOURCE="$PWD" ;;
+    --source=*) LOCAL_SOURCE="${arg#--source=}" ;;
     -h|--help)
       cat <<'EOF'
 Usage: install.sh [options]
@@ -224,6 +235,11 @@ Usage: install.sh [options]
                            them container-internal and unreachable.
   --repo=URL               Override the default panel repo SSH URL.
   --channel=GLOB           Release tag glob to install (default: v*).
+  --source=local|PATH      DEVELOPMENT ONLY. Install from a local working tree
+                           (default: $PWD) instead of a signed release tag.
+                           Skips tag resolution, the clone and the GPG
+                           signature check entirely. Never use this on a real
+                           server; see scripts/dev-vm.sh.
   --target=docker|native   Deployment target (default: docker). native installs
                            everything as real systemd units directly on this
                            host instead of via Docker -- see
@@ -235,6 +251,7 @@ Environment overrides (for --unattended use):
   WBK_CSF_SOURCE_REPO (GitHub "owner/repo" to fetch CSF from, default
   Aetherinox/csf-firewall -- override if that source ever goes away too),
   WBK_TARGET (docker|native, same as --target),
+  WBK_LOCAL_SOURCE (path, same as --source= -- development only),
   WBK_WEBMAIL_REPO_URL / WBK_WEBMAIL_REPO_REF (the webmail fork to install and
   the tag/commit to pin it to; both empty by default, in which case webmail is
   simply not provisioned and /webmail/ serves a "not configured" page, leaving
@@ -417,6 +434,40 @@ fetch_release() {
   GIT_SSH_COMMAND="$(git_ssh_command)" git -c advice.detachedHead=false \
     clone --quiet --depth 1 --branch "$tag" "$REPO_URL" "$dest" \
     || die "could not fetch tag '$tag' from $REPO_URL -- confirm the deploy key was added with read access"
+}
+
+# The --source= counterpart to fetch_release: put a LOCAL working tree at
+# $dest instead of a verified release checkout.
+#
+# Preserves an existing .env exactly as fetch_release does, for the same
+# FERNET_KEY reason, and excludes the build/VCS noise a working tree carries
+# that a release checkout never would (.git, node_modules, __pycache__, the
+# local sqlite dev DB) so a dev install is not silently seeded with them.
+stage_local_source() {
+  local src="$1" dest="$2"
+  [ -d "$src" ] || die "--source path '$src' is not a directory"
+  [ -f "$src/scripts/lib/native-install.sh" ] || \
+    die "--source path '$src' does not look like the wbk repo (no scripts/lib/native-install.sh)"
+
+  warn "INSTALLING FROM A LOCAL TREE: $src"
+  warn "Nothing about this install is signed or verified. Development use only."
+
+  if [ -f "$dest/.env" ]; then
+    ENV_BACKUP="$(mktemp)"
+    cp "$dest/.env" "$ENV_BACKUP"
+  fi
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  # tar rather than rsync: rsync is not installed on a stock Ubuntu cloud
+  # image, and this needs to work on a VM that has only just booted.
+  tar -C "$src" \
+      --exclude=.git \
+      --exclude=node_modules \
+      --exclude=__pycache__ \
+      --exclude=.pytest_cache \
+      --exclude='*.pyc' \
+      --exclude=services/api/data \
+      -cf - . | tar -C "$dest" -xf -
 }
 
 verify_release_signature() {
@@ -1251,16 +1302,22 @@ main() {
   require_cmd ssh-keygen
   require_cmd openssl
 
-  setup_deploy_key
+  if [ -n "$LOCAL_SOURCE" ]; then
+    # No deploy key, no tag resolution, no signature: none of them have
+    # anything to act on when the source is a directory on this machine.
+    stage_local_source "$LOCAL_SOURCE" "$WBK_INSTALL_DIR"
+  else
+    setup_deploy_key
 
-  info "resolving the latest release on channel '$RELEASE_CHANNEL'"
-  local tag
-  tag="$(latest_release_tag)"
-  [ -n "$tag" ] || die "no tags matching '$RELEASE_CHANNEL' found on $REPO_URL"
-  info "installing $tag"
+    info "resolving the latest release on channel '$RELEASE_CHANNEL'"
+    local tag
+    tag="$(latest_release_tag)"
+    [ -n "$tag" ] || die "no tags matching '$RELEASE_CHANNEL' found on $REPO_URL"
+    info "installing $tag"
 
-  fetch_release "$tag" "$WBK_INSTALL_DIR"
-  verify_release_signature "$tag" "$WBK_INSTALL_DIR"
+    fetch_release "$tag" "$WBK_INSTALL_DIR"
+    verify_release_signature "$tag" "$WBK_INSTALL_DIR"
+  fi
   install_wbk_cli
 
   configure_access
