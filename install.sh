@@ -11,18 +11,17 @@
 # docs/architecture/installation.md for why a separate public repo, not
 # this private one, serves the actual public URL.
 #
-# Contains no proprietary code -- this file only orchestrates: it installs
-# Docker, generates a read-only GitHub deploy key, fetches a GPG-signed
-# release tag of the private wbk repo over git using that key (the exact
-# same fetch+verify mechanism app.modules.updates.git_source/gpg use once
-# the panel is running -- see docs/architecture/self-update.md), sets up
-# CSF + wbk-hostagent on the host, and brings the panel up via
-# `docker compose`.
+# Contains no proprietary code -- this file only orchestrates: it generates a
+# read-only GitHub deploy key, fetches a GPG-signed release tag of the private
+# wbk repo over git using that key (the exact same fetch+verify mechanism
+# app.modules.updates.git_source/gpg use once the panel is running -- see
+# docs/architecture/self-update.md), installs and configures CSF on the host,
+# and installs the panel itself as real systemd units via
+# scripts/lib/native-install.sh.
 #
-# Supported host OS: Ubuntu 22.04 LTS (primary, matches the container's own
-# base image exactly) or Ubuntu 24.04 LTS (expected to work, less
-# exercised). Anything else is a hard stop unless --force-unsupported-os is
-# passed. See docs/architecture/installation.md.
+# Supported host OS: Ubuntu 22.04 LTS (primary) or Ubuntu 24.04 LTS (expected
+# to work, less exercised). Anything else is a hard stop unless
+# --force-unsupported-os is passed. See docs/architecture/installation.md.
 #
 # Safe to re-run: every step below either checks for existing state first or
 # is naturally idempotent (writing the same systemd unit, re-running
@@ -30,16 +29,20 @@
 # duplicating work. Refuses to touch an already-running install without
 # --force.
 #
-# On --target=native there is also a narrower, non-interactive way to re-assert
-# just the system configuration this installer owns, without re-running any of
-# the package installs or prompts below:
+# There is also a narrower, non-interactive way to re-assert just the system
+# configuration this installer owns, without re-running any of the package
+# installs or prompts below:
 #
 #     sudo bash /opt/wbk/scripts/lib/native-install.sh --reconcile
 #
 # That is what a panel self-update runs for itself after swapping in new code
 # (docs/architecture/self-update.md), and what an operator runs to repair a box
 # whose rendered config, grants or systemd drop-ins have drifted from the
-# release it is running.
+# release it is running. A box whose Linux accounts or per-site vhosts/pools
+# have themselves been lost needs the heavier rebuild-from-database repair
+# instead:
+#
+#     sudo bash /opt/wbk/scripts/lib/native-install.sh --repair-state
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -47,7 +50,6 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 WBK_INSTALL_DIR="${WBK_INSTALL_DIR:-/opt/wbk}"
-WBK_HOSTAGENT_DIR="/opt/wbk-hostagent"
 # Deliberately NOT under $WBK_INSTALL_DIR: fetch_release() below does
 # `rm -rf "$WBK_INSTALL_DIR"` immediately before every clone (including
 # re-fetches on a --force reinstall), which would delete the deploy key
@@ -63,7 +65,7 @@ WBK_HOSTAGENT_DIR="/opt/wbk-hostagent"
 WBK_DEPLOY_KEY_PATH="/opt/wbk-secrets/deploy_key"
 DEFAULT_REPO_URL="git@github.com:weboook/wbk.git"
 DEFAULT_RELEASE_CHANNEL="v*"
-# --target=native's persistent-data root (see docs/architecture/
+# The persistent-data root (see docs/architecture/
 # native-deployment.md) -- deliberately not nested under $WBK_INSTALL_DIR,
 # same EXDEV/rm-rf-safety reasoning as WBK_DEPLOY_KEY_PATH above. Defined
 # here (not just in scripts/lib/native-install.sh) so write_env_file()
@@ -191,14 +193,6 @@ SKIP_MAIL=0
 REPO_URL="${WBK_REPO_URL:-$DEFAULT_REPO_URL}"
 RELEASE_CHANNEL="${WBK_RELEASE_CHANNEL:-$DEFAULT_RELEASE_CHANNEL}"
 DEPLOY_KEY_MODE="${WBK_DEPLOY_KEY_MODE:-generate}"  # generate | paste
-# docker (default): everything runs in the existing container topology,
-# completely unchanged (docker-compose.yml/Dockerfile/docker/*.conf are
-# never touched by this script either way). native: real systemd units,
-# apt packages, and a /opt/wbk (code) + /var/lib/wbk (data) layout on the
-# bare host instead -- see docs/architecture/native-deployment.md and
-# scripts/lib/native-install.sh, which this script sources and calls only
-# when this is "native".
-TARGET="${WBK_TARGET:-docker}"
 
 # DEVELOPMENT ONLY: install from a local working tree instead of a fetched,
 # GPG-verified release tag. Empty by default and gated behind an explicit flag,
@@ -218,7 +212,6 @@ for arg in "$@"; do
     --skip-mail) SKIP_MAIL=1 ;;
     --repo=*) REPO_URL="${arg#--repo=}" ;;
     --channel=*) RELEASE_CHANNEL="${arg#--channel=}" ;;
-    --target=*) TARGET="${arg#--target=}" ;;
     --source=local) LOCAL_SOURCE="$PWD" ;;
     --source=*) LOCAL_SOURCE="${arg#--source=}" ;;
     -h|--help)
@@ -227,12 +220,9 @@ Usage: install.sh [options]
   --force                  Reinstall over an already-provisioned /opt/wbk.
   --force-unsupported-os   Continue on a host OS other than Ubuntu 22.04/24.04.
   --unattended             Never prompt; use flags/env vars/defaults only.
-  --skip-csf               Skip CSF + wbk-hostagent setup entirely.
-  --skip-mail              No mail server. On --target=native nothing mail-
-                           related is installed at all; on --target=docker
-                           (where Postfix/Dovecot are always in the image) it
-                           means the firewall never opens SMTP/IMAP, leaving
-                           them container-internal and unreachable.
+  --skip-csf               Skip CSF setup entirely.
+  --skip-mail              No mail server: nothing mail-related is installed
+                           and the firewall never opens SMTP/IMAP.
   --repo=URL               Override the default panel repo SSH URL.
   --channel=GLOB           Release tag glob to install (default: v*).
   --source=local|PATH      DEVELOPMENT ONLY. Install from a local working tree
@@ -240,17 +230,12 @@ Usage: install.sh [options]
                            Skips tag resolution, the clone and the GPG
                            signature check entirely. Never use this on a real
                            server; see scripts/dev-vm.sh.
-  --target=docker|native   Deployment target (default: docker). native installs
-                           everything as real systemd units directly on this
-                           host instead of via Docker -- see
-                           docs/architecture/native-deployment.md.
 Environment overrides (for --unattended use):
   WBK_PANEL_DOMAIN, WBK_PANEL_IP, WBK_ADMIN_EMAIL, WBK_ADMIN_PASSWORD,
   WBK_PANEL_HOST_PORT, WBK_TENANT_HOST_PORT, WBK_DEPLOY_KEY_MODE (generate|paste),
   WBK_DEPLOY_KEY_PRIVATE (required if WBK_DEPLOY_KEY_MODE=paste),
   WBK_CSF_SOURCE_REPO (GitHub "owner/repo" to fetch CSF from, default
   Aetherinox/csf-firewall -- override if that source ever goes away too),
-  WBK_TARGET (docker|native, same as --target),
   WBK_LOCAL_SOURCE (path, same as --source= -- development only),
   WBK_WEBMAIL_REPO_URL / WBK_WEBMAIL_REPO_REF (the webmail fork to install and
   the tag/commit to pin it to; both empty by default, in which case webmail is
@@ -314,9 +299,9 @@ check_os() {
 }
 
 check_existing_install() {
-  if [ -d "$WBK_INSTALL_DIR/.git" ] || [ -f "$WBK_INSTALL_DIR/docker-compose.yml" ]; then
+  if [ -d "$WBK_INSTALL_DIR/.git" ] || [ -f "$WBK_INSTALL_DIR/VERSION" ]; then
     if [ "$FORCE" != "1" ]; then
-      die "$WBK_INSTALL_DIR already looks provisioned -- pass --force to reinstall over it (existing data volumes are untouched either way)"
+      die "$WBK_INSTALL_DIR already looks provisioned -- pass --force to reinstall over it (the data root at $WBK_DATA_ROOT_NATIVE is untouched either way)"
     fi
     warn "reinstalling over existing $WBK_INSTALL_DIR (--force)"
   fi
@@ -324,20 +309,6 @@ check_existing_install() {
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
-}
-
-# ---------------------------------------------------------------------------
-# Docker
-# ---------------------------------------------------------------------------
-
-install_docker() {
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    info "Docker + Compose plugin already installed, skipping"
-    return
-  fi
-  info "installing Docker Engine + Compose plugin"
-  curl -fsSL https://get.docker.com | sh
-  systemctl enable --now docker
 }
 
 # ---------------------------------------------------------------------------
@@ -421,11 +392,11 @@ fetch_release() {
   info "fetching release $tag"
   # A --force reinstall's `rm -rf "$dest"` below would otherwise also
   # delete .env, taking FERNET_KEY with it -- this codebase's own documented
-  # invariant (see docker-compose.yml's FERNET_KEY comment) is that
-  # regenerating that key makes every already-encrypted secret in the
-  # persisted data volume (tenant DB passwords, etc.) permanently
-  # undecryptable. Preserve any existing .env across the reinstall instead
-  # of ever letting write_env_file below generate a fresh one over it.
+  # invariant (see docs/pending/secret-rotation.md) is that regenerating that
+  # key makes every already-encrypted secret in the data root (tenant DB
+  # passwords, etc.) permanently undecryptable. Preserve any existing .env
+  # across the reinstall instead of ever letting write_env_file below generate
+  # a fresh one over it.
   if [ -f "$dest/.env" ]; then
     ENV_BACKUP="$(mktemp)"
     cp "$dest/.env" "$ENV_BACKUP"
@@ -492,12 +463,10 @@ verify_release_signature() {
   info "GPG signature verified for $tag"
 }
 
-# services/cli/wbk always runs on THIS host regardless of target -- even on
-# --target=docker, it needs `docker`/`docker compose` and this install's own
-# docker-compose.yml, none of which exist inside the container itself (see
-# docs/cli.md and the CLI's own module docstring for the full design). A
-# symlink, not a copy, so a future self-update's directory-swap (which
-# replaces $WBK_INSTALL_DIR/services wholesale, not this path) picks up a
+# services/cli/wbk drives this host's own systemd units and reads this install's
+# .env directly (see docs/cli.md and the CLI's own module docstring for the full
+# design). A symlink, not a copy, so a future self-update's directory-swap
+# (which replaces $WBK_INSTALL_DIR/services wholesale, not this path) picks up a
 # newer wbk automatically without install.sh ever having to re-run this step.
 install_wbk_cli() {
   # Guards against a release tag older than the CLI itself (this function's
@@ -544,9 +513,8 @@ ADMIN_ALREADY_EXISTS=0
 # only "is csf installed", never whether it actually finished configuring,
 # so it claimed "CSF active" even on a run that had JUST printed a warning
 # that it was leaving CSF in TESTING mode. install_csf() itself still
-# returns success in that case (hostagent setup should still proceed
-# either way), so CSF_SETUP_FAILED alone can't distinguish this from a
-# genuinely healthy CSF.
+# returns success in that case, so CSF_SETUP_FAILED alone can't
+# distinguish this from a genuinely healthy CSF.
 CSF_TESTING_MODE_LEFT_ON=0
 
 detect_public_ip() {
@@ -648,16 +616,10 @@ configure_ports() {
 # native target the mail install steps themselves), and must never re-prompt.
 #
 # Deliberately lives here rather than in scripts/lib/native-install.sh (whose
-# want_native_mail() now just delegates to this): setup_csf_and_hostagent runs
-# BEFORE that file is ever sourced, and opening SMTP/IMAP ports on a box that
-# will not run a mail server, or refusing to open them on one that will, are
-# both real misconfigurations.
-#
-# The Docker target has no mail opt-out of its own (the image always ships
-# Postfix/Dovecot and supervisord always starts them), so --skip-mail there
-# means exactly one thing: the firewall never opens the mail ports, leaving
-# those daemons container-internal and unreachable. That IS the effective
-# opt-out on that target; documented in --help rather than pretended otherwise.
+# want_native_mail() now just delegates to this): setup_csf runs BEFORE that
+# file is ever sourced, and opening SMTP/IMAP ports on a box that will not run
+# a mail server, or refusing to open them on one that will, are both real
+# misconfigurations.
 _WANT_MAIL_RESOLVED=""
 want_mail() {
   if [ -n "$_WANT_MAIL_RESOLVED" ]; then
@@ -669,11 +631,6 @@ want_mail() {
     info "mail server disabled (--skip-mail): SMTP/IMAP ports stay closed"
     return 1
   fi
-  if [ "$TARGET" = "docker" ]; then
-    # Nothing to ask: the image itself always contains and starts them.
-    _WANT_MAIL_RESOLVED="yes"
-    return 0
-  fi
   if confirm "Install the mail server (Postfix, Dovecot, webmail) for hosting email on this box"; then
     _WANT_MAIL_RESOLVED="yes"
     return 0
@@ -684,7 +641,7 @@ want_mail() {
 }
 
 # ---------------------------------------------------------------------------
-# CSF + wbk-hostagent (host-level, see docs/architecture/csf-firewall.md)
+# CSF (host-level, see docs/architecture/csf-firewall.md)
 # ---------------------------------------------------------------------------
 
 detect_ssh_port() {
@@ -825,10 +782,8 @@ install_csf() {
   csf_add_port tcp_in 443
   csf_add_port tcp_in "$PANEL_HOST_PORT"
   csf_add_port tcp_in "$TENANT_HOST_PORT"
-  # PowerDNS is part of every install on both targets (an apt package natively,
-  # a supervisord program in the container, published by docker-compose.yml's
-  # own `ports:`), and the panel's DNS Administration feature is useless without
-  # it being reachable.
+  # PowerDNS is an apt package on every install, and the panel's DNS
+  # Administration feature is useless without it being reachable.
   csf_add_port tcp_in 53
   csf_add_port udp_in 53
 
@@ -843,9 +798,8 @@ install_csf() {
 
   if want_mail; then
     # 25 inbound MX, 465 submissions (implicit TLS), 587 submission (STARTTLS),
-    # 143 IMAP+STARTTLS, 993 IMAPS, matching docker-compose.yml's published
-    # ports and configs/postfix/master.cf + configs/dovecot/dovecot.conf's own
-    # listeners exactly.
+    # 143 IMAP+STARTTLS, 993 IMAPS, matching configs/postfix/master.cf +
+    # configs/dovecot/dovecot.conf's own listeners exactly.
     for mail_port in 25 465 587 143 993; do
       csf_add_port tcp_in "$mail_port"
     done
@@ -863,10 +817,7 @@ install_csf() {
   # TESTING=1 first: csf -r under testing mode auto-reverts to the previous
   # ruleset after 5 minutes if this script (or the operator) never confirms
   # it's safe -- the single most important safety property of this step.
-  # DOCKER=1 is CSF's own documented Docker-compatibility flag; without it
-  # CSF's iptables management fights Docker's own DNAT/FORWARD rules.
   sed -i 's/^TESTING = .*/TESTING = "1"/' /etc/csf/csf.conf
-  sed -i 's/^DOCKER = .*/DOCKER = "1"/' /etc/csf/csf.conf
   sed -i "s/^TCP_IN = .*/TCP_IN = \"${tcp_in}\"/" /etc/csf/csf.conf
   sed -i "s/^TCP_OUT = .*/TCP_OUT = \"${tcp_out}\"/" /etc/csf/csf.conf
   # UDP_IN was never written before, so whatever the shipped csf.conf happened
@@ -984,38 +935,20 @@ ensure_venv() {
   python3 -m venv "$venv_path"
 }
 
-install_hostagent() {
-  info "setting up wbk-hostagent"
-  mkdir -p "$WBK_HOSTAGENT_DIR/app"
-  rm -rf "$WBK_HOSTAGENT_DIR/app/wbk_hostagent" "$WBK_HOSTAGENT_DIR/app/shared"
-  cp -a "$WBK_INSTALL_DIR/services/hostagent/wbk_hostagent" "$WBK_HOSTAGENT_DIR/app/wbk_hostagent"
-  cp -a "$WBK_INSTALL_DIR/shared" "$WBK_HOSTAGENT_DIR/app/shared"
-
-  ensure_python_venv_support
-  ensure_venv "$WBK_HOSTAGENT_DIR/venv"
-  "$WBK_HOSTAGENT_DIR/venv/bin/pip" install --quiet --upgrade pip
-  "$WBK_HOSTAGENT_DIR/venv/bin/pip" install --quiet -r "$WBK_INSTALL_DIR/services/hostagent/requirements.txt"
-
-  cp "$WBK_INSTALL_DIR/services/hostagent/wbk-hostagent.service" /etc/systemd/system/wbk-hostagent.service
-  systemctl daemon-reload
-  systemctl enable --now wbk-hostagent
-  info "wbk-hostagent running"
-}
-
-setup_csf_and_hostagent() {
+# The panel drives CSF through wbkd, which is root on this same host, so
+# there is nothing to set up here beyond CSF itself. Installs before this one
+# also laid down a second daemon for it (wbk-hostagent); native-install.sh's
+# --reconcile is what removes that from a box which still has one.
+setup_csf() {
   if [ "$SKIP_CSF" = "1" ]; then
-    info "skipping CSF + wbk-hostagent setup (--skip-csf)"
+    info "skipping CSF setup (--skip-csf)"
     return
   fi
   if [ "$UNATTENDED" != "1" ] && [ "$HAS_TTY" = "1" ] && ! confirm "Install CSF (recommended: firewall + brute-force protection)"; then
     info "skipping CSF at your request"
     return
   fi
-  if install_csf; then
-    install_hostagent
-  else
-    CSF_SETUP_FAILED=1
-  fi
+  install_csf || CSF_SETUP_FAILED=1
 }
 
 # ---------------------------------------------------------------------------
@@ -1032,9 +965,9 @@ random_secret() {
 # what configs/postfix/main.cf.template's old hardcoded `mail.localhost` was.
 # mail.<panel domain> is the conventional choice and matches the per-domain
 # `mail.<domain>` hostnames app.modules.mail.dns_automation already publishes.
-# Empty in IP mode with no real host FQDN, in which case both targets fall back
-# and warn (see docker/entrypoint.sh and render_native_mail_config), rather than
-# silently announcing something a receiver will refuse.
+# Empty in IP mode with no real host FQDN, in which case resolve_native_mail_
+# hostname falls back and warns, rather than silently announcing something a
+# receiver will refuse.
 derive_mail_hostname() {
   if [ -n "$PANEL_DOMAIN" ]; then
     echo "mail.${PANEL_DOMAIN}"
@@ -1094,14 +1027,11 @@ PANEL_HOST_PORT=${PANEL_HOST_PORT}
 TENANT_HOST_PORT=${TENANT_HOST_PORT}
 EOF
 
-  if [ "$TARGET" = "native" ]; then
-    # WBK_APP_ROOT/WBK_DATA_ROOT/WBK_SERVICE_MANAGER match wbkd.service /
-    # wbk-api.service's own Environment= lines (services/agent/*.service) --
-    # spelled out here too since app.core.config's pydantic Settings (unlike
-    # wbkd's plain os.environ.get reads) needs its own explicit overrides for
-    # every setting whose container default would otherwise still point at
-    # /app -- see docs/architecture/native-deployment.md's settings table.
-    cat >> "$WBK_INSTALL_DIR/.env" <<EOF
+  # WBK_APP_ROOT/WBK_DATA_ROOT/WBK_SERVICE_MANAGER match wbkd.service /
+  # wbk-api.service's own Environment= lines (services/agent/*.service), and
+  # are spelled out here too so anything reading .env directly (the wbk CLI,
+  # an operator's own shell) sees the same layout the units do.
+  cat >> "$WBK_INSTALL_DIR/.env" <<EOF
 WBK_APP_ROOT=${WBK_INSTALL_DIR}
 WBK_DATA_ROOT=${WBK_DATA_ROOT_NATIVE}
 WBK_SERVICE_MANAGER=systemd
@@ -1111,39 +1041,26 @@ TICKET_ATTACHMENTS_DIR=${WBK_DATA_ROOT_NATIVE}/ticket-attachments
 UPDATES_DEPLOY_KEY_PATH=${WBK_DEPLOY_KEY_PATH}
 RELEASE_SIGNING_PUBKEY_PATH=${WBK_INSTALL_DIR}/configs/updates/release-signing-key.asc
 EOF
-    # UPDATES_DEPLOY_KEY_PATH above deliberately points at the SAME key
-    # setup_deploy_key() already generated and the operator already
-    # registered as a GitHub deploy key -- not a second, separately
-    # lazily-generated one (app.modules.updates.deploy_key's
-    # ensure_deploy_key() only generates a fresh key if none exists yet at
-    # this path, so pointing it here means it finds this one and reuses it
-    # instead). That file is root-owned 0600 (setup_deploy_key runs as
-    # root); wbk-api.service runs as the unprivileged `wbk` user, so it
-    # can't read it as-is. scripts/lib/native-install.sh's
-    # secure_deploy_key_for_native() re-owns it to wbk:wbk once that
-    # account exists -- can't be done here, this runs before
-    # create_native_accounts().
-  fi
+  # UPDATES_DEPLOY_KEY_PATH above deliberately points at the SAME key
+  # setup_deploy_key() already generated and the operator already registered as
+  # a GitHub deploy key -- not a second, separately lazily-generated one
+  # (app.modules.updates.deploy_key's ensure_deploy_key() only generates a fresh
+  # key if none exists yet at this path, so pointing it here means it finds this
+  # one and reuses it instead). That file is root-owned 0600 (setup_deploy_key
+  # runs as root); wbk-api.service runs as the unprivileged `wbk` user, so it
+  # can't read it as-is. scripts/lib/native-install.sh's
+  # secure_deploy_key_for_native() re-owns it to wbk:wbk once that account
+  # exists -- can't be done here, this runs before create_native_accounts().
 
   chmod 600 "$WBK_INSTALL_DIR/.env"
 }
 
-bring_up_panel() {
-  info "building the panel image (this takes a few minutes on first install)"
-  (cd "$WBK_INSTALL_DIR" && docker compose build)
-  info "starting the panel"
-  (cd "$WBK_INSTALL_DIR" && docker compose up -d)
-}
-
-# The Docker target always reaches uvicorn through nginx's :8000/API-proxy
-# server block, itself mapped to PANEL_HOST_PORT by docker-compose's own
-# `ports:`. The native target's render_native_panel_nginx_vhost (see
-# scripts/lib/native-install.sh) listens on :80 directly in domain mode
-# (SSL/DNS features expect the panel's own vhost at the real public port),
-# or PANEL_HOST_PORT in IP mode, same as Docker -- so only domain-mode
-# native diverges from "check PANEL_HOST_PORT".
+# render_native_panel_nginx_vhost (see scripts/lib/native-install.sh) listens on
+# :80 directly in domain mode, since the SSL/DNS features expect the panel's own
+# vhost at the real public port. In IP mode it listens on PANEL_HOST_PORT
+# instead, a dedicated port where being the default server is correct.
 health_check_port() {
-  if [ "$TARGET" = "native" ] && [ -n "$PANEL_DOMAIN" ]; then
+  if [ -n "$PANEL_DOMAIN" ]; then
     echo "80"
   else
     echo "$PANEL_HOST_PORT"
@@ -1161,44 +1078,45 @@ wait_for_health() {
     fi
     sleep 2
   done
-  if [ "$TARGET" = "native" ]; then
-    warn "panel did not report healthy within two minutes -- check 'systemctl status wbk-api wbkd' and 'journalctl -u wbk-api -u wbkd'"
-  else
-    warn "panel did not report healthy within two minutes -- check 'docker compose logs' in $WBK_INSTALL_DIR"
-  fi
+  warn "panel did not report healthy within two minutes -- check 'systemctl status wbk-api wbkd' and 'journalctl -u wbk-api -u wbkd'"
 }
 
+# Reads the admin table straight out of the sqlite file with the standard
+# library, so it needs neither the app's venv nor its models. That is what lets
+# it run BEFORE the panel boots, which is the whole point: see
+# check_admin_already_exists below.
 _ADMIN_COUNT_SCRIPT='
-from app.db.session import SessionLocal
-from app.db.models import AdminUser
-db = SessionLocal()
-print(db.query(AdminUser).count())
+import sqlite3, sys
+try:
+    con = sqlite3.connect(sys.argv[1])
+    print(con.execute("select count(*) from admin_users").fetchone()[0])
+except Exception:
+    # No database file yet, or no table yet: either way this box has no admin.
+    print(0)
 '
 
-# Direct DB query, run after the panel is confirmed healthy (so migrations
-# have definitely already applied and the table definitely exists) -- see
-# ADMIN_ALREADY_EXISTS's own comment above for why this has to be a real
-# query rather than inferred from .env. Never fatal: a query failure just
-# leaves ADMIN_ALREADY_EXISTS at its default (0), which only affects
-# print_summary()'s wording, not anything that actually matters functionally.
+# Whether an admin existed BEFORE this run, which is the only thing the summary
+# actually wants to know.
+#
+# This used to run after wait_for_health, and was therefore guaranteed to be
+# wrong on a fresh install: the API creates the first admin from
+# ADMIN_BOOTSTRAP_* on its own first boot, so by the time the panel was healthy
+# the row this check looks for always existed. Every first-time installer was
+# told the credentials they had just chosen "were NOT applied" while those
+# credentials worked fine. Running before run_native_install is what makes the
+# answer mean "a previous install left an admin here", which is what
+# print_summary claims it means.
+#
+# Never fatal: a failure leaves ADMIN_ALREADY_EXISTS at 0, which only affects
+# print_summary's wording.
 check_admin_already_exists() {
-  local count script_path
-  if [ "$TARGET" = "native" ]; then
-    script_path="$(mktemp --suffix=.py)"
-    printf '%s' "$_ADMIN_COUNT_SCRIPT" > "$script_path"
-    chmod 644 "$script_path"
-    count="$(su -s /bin/bash wbk -c "cd $WBK_INSTALL_DIR/services/api && \
-      PYTHONPATH=$WBK_INSTALL_DIR/services/api:$WBK_INSTALL_DIR \
-      DATABASE_URL=sqlite:///$WBK_DATA_ROOT_NATIVE/wbk.db \
-      $WBK_INSTALL_DIR/venv-api/bin/python $script_path" 2>/dev/null | tail -n1)"
-    rm -f "$script_path"
-  else
-    local cid
-    cid="$(cd "$WBK_INSTALL_DIR" && docker compose ps -q wbk 2>/dev/null)"
-    [ -n "$cid" ] || return
-    count="$(docker exec -e PYTHONPATH=/app/services/api:/app "$cid" \
-      python3 -c "$_ADMIN_COUNT_SCRIPT" 2>/dev/null | tail -n1)"
-  fi
+  local count script_path db_path
+  db_path="$WBK_DATA_ROOT_NATIVE/wbk.db"
+  [ -f "$db_path" ] || return 0
+  script_path="$(mktemp --suffix=.py)"
+  printf '%s' "$_ADMIN_COUNT_SCRIPT" > "$script_path"
+  count="$(python3 "$script_path" "$db_path" 2>/dev/null | tail -n1)"
+  rm -f "$script_path"
   if [ -n "$count" ] && [ "$count" -gt 0 ] 2>/dev/null; then
     ADMIN_ALREADY_EXISTS=1
   fi
@@ -1241,7 +1159,7 @@ print_summary() {
     echo "           Re-run this installer to retry (everything else is left" >&2
     echo "           untouched), or install CSF by hand." >&2
   fi
-  if [ "$TARGET" = "native" ] && command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet pdns; then
+  if command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet pdns; then
     echo " DNS:      pdns.service is NOT running -- DNS features are unavailable." >&2
     echo "           journalctl -xeu pdns.service (a port 53 conflict with" >&2
     echo "           systemd-resolved is the most common cause)." >&2
@@ -1249,12 +1167,10 @@ print_summary() {
   echo " Install:  $WBK_INSTALL_DIR (.env holds every generated secret)" >&2
   echo " Updates:  Settings -> Updates in the panel from here on (git + this" >&2
   echo "           same deploy key, no more manual steps)." >&2
-  if [ "$TARGET" = "native" ]; then
-    echo " Repair:   sudo bash $WBK_INSTALL_DIR/scripts/lib/native-install.sh --reconcile" >&2
-    echo "           re-asserts this box's rendered config, grants and systemd" >&2
-    echo "           drop-ins from the installed release. Installs nothing," >&2
-    echo "           prompts for nothing, safe to run at any time." >&2
-  fi
+  echo " Repair:   sudo bash $WBK_INSTALL_DIR/scripts/lib/native-install.sh --reconcile" >&2
+  echo "           re-asserts this box's rendered config, grants and systemd" >&2
+  echo "           drop-ins from the installed release. Installs nothing," >&2
+  echo "           prompts for nothing, safe to run at any time." >&2
   if command -v wbk >/dev/null 2>&1; then
     echo " CLI:      wbk status | wbk doctor | sudo wbk login  (see docs/cli.md)" >&2
   fi
@@ -1269,11 +1185,6 @@ print_summary() {
 # ---------------------------------------------------------------------------
 
 main() {
-  case "$TARGET" in
-    docker|native) ;;
-    *) die "unrecognized --target='$TARGET' -- must be 'docker' or 'native'" ;;
-  esac
-
   require_root
   # fetch_release() below does `rm -rf "$WBK_INSTALL_DIR"` (/opt/wbk by
   # default) immediately before every clone, including every --force
@@ -1295,9 +1206,6 @@ main() {
   require_cmd curl
   require_cmd git
 
-  if [ "$TARGET" = "docker" ]; then
-    install_docker
-  fi
   require_cmd gpg
   require_cmd ssh-keygen
   require_cmd openssl
@@ -1324,24 +1232,24 @@ main() {
   configure_admin
   configure_ports
 
-  setup_csf_and_hostagent
+  setup_csf
 
   write_env_file
 
-  if [ "$TARGET" = "native" ]; then
-    # Sourced from the just-fetched, just-signature-verified release
-    # checkout (not from wherever this install.sh itself happened to run
-    # from -- curl | bash means there may be no local file for that at
-    # all) -- see scripts/lib/native-install.sh's own header comment.
-    # shellcheck source=/dev/null
-    source "$WBK_INSTALL_DIR/scripts/lib/native-install.sh"
-    run_native_install
-  else
-    bring_up_panel
-  fi
+  # Sourced from the just-fetched, just-signature-verified release checkout (not
+  # from wherever this install.sh itself happened to run from -- curl | bash
+  # means there may be no local file for that at all) -- see
+  # scripts/lib/native-install.sh's own header comment.
+  # shellcheck source=/dev/null
+  source "$WBK_INSTALL_DIR/scripts/lib/native-install.sh"
+
+  # Before the panel boots, so it reports a PREVIOUS install's admin rather than
+  # the one this run is about to bootstrap.
+  check_admin_already_exists
+
+  run_native_install
 
   wait_for_health
-  check_admin_already_exists
   print_summary
 }
 
