@@ -1114,6 +1114,25 @@ except Exception:
     print(0)
 '
 
+# Postgres counterpart of the sqlite3 one-liner above, for a panel DB whose
+# DATABASE_URL is postgresql://... rather than sqlite:///... . `psql` (not
+# the app's own venv) for the same "runs before the panel boots" reason -
+# ships as part of the already-unconditionally-installed `postgresql`
+# package, so no extra dependency. `psql` accepts a full connection URI as
+# its first argument directly (libpq has since PG 9.2), so no manual
+# host/port/user/password parsing is needed here. Same "no table yet reads
+# as 0, never a failure" tolerance as the sqlite path: a fresh install's
+# panel database exists (created by the migration step) but the table is
+# only populated by the app's own first boot, and a connection failure (wrong
+# password, server not up yet) is exactly as uninformative as "no admin" for
+# this check's only real purpose, which is `print_summary`'s wording.
+_admin_count_postgres() {
+  local db_url="$1" count
+  command -v psql >/dev/null 2>&1 || { echo 0; return; }
+  count="$(psql "$db_url" -tAc 'select count(*) from admin_users' 2>/dev/null | tail -n1)"
+  echo "${count:-0}"
+}
+
 # Whether an admin existed BEFORE this run, which is the only thing the summary
 # actually wants to know.
 #
@@ -1129,13 +1148,21 @@ except Exception:
 # Never fatal: a failure leaves ADMIN_ALREADY_EXISTS at 0, which only affects
 # print_summary's wording.
 check_admin_already_exists() {
-  local count script_path db_path
-  db_path="$WBK_DATA_ROOT_NATIVE/wbk.db"
-  [ -f "$db_path" ] || return 0
-  script_path="$(mktemp --suffix=.py)"
-  printf '%s' "$_ADMIN_COUNT_SCRIPT" > "$script_path"
-  count="$(python3 "$script_path" "$db_path" 2>/dev/null | tail -n1)"
-  rm -f "$script_path"
+  local count script_path db_path db_url
+  db_url="$(env_file_get DATABASE_URL "$WBK_INSTALL_DIR/.env" 2>/dev/null || true)"
+  case "$db_url" in
+    postgresql://*|postgres://*)
+      count="$(_admin_count_postgres "$db_url")"
+      ;;
+    *)
+      db_path="$WBK_DATA_ROOT_NATIVE/wbk.db"
+      [ -f "$db_path" ] || return 0
+      script_path="$(mktemp --suffix=.py)"
+      printf '%s' "$_ADMIN_COUNT_SCRIPT" > "$script_path"
+      count="$(python3 "$script_path" "$db_path" 2>/dev/null | tail -n1)"
+      rm -f "$script_path"
+      ;;
+  esac
   if [ -n "$count" ] && [ "$count" -gt 0 ] 2>/dev/null; then
     ADMIN_ALREADY_EXISTS=1
   fi
