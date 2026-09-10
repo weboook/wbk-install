@@ -280,7 +280,19 @@ LOG_FILE=""
 setup_logging() {
   local log_dir="/var/log/wbk-install"
   mkdir -p "$log_dir" 2>/dev/null || return
+  # print_summary echoes the freshly generated admin password to stdout,
+  # which this redirect captures verbatim - this log otherwise landed
+  # world-readable (the default mkdir/umask leaves it 755/644), so any local
+  # unprivileged user could read a fresh install's admin login off disk
+  # indefinitely. chmod the dir before anything is ever written under it
+  # (also tightens an already-existing dir from a prior run), and create the
+  # file under a tightened umask plus its own chmod before `tee` ever writes
+  # to it, so there is no window where it exists world-readable even
+  # briefly. Same posture write_env_file already gives `.env`.
+  chmod 700 "$log_dir" 2>/dev/null || true
   LOG_FILE="$log_dir/install-$(date -u +%Y%m%dT%H%M%SZ).log"
+  ( umask 077 && : > "$LOG_FILE" ) 2>/dev/null || return
+  chmod 600 "$LOG_FILE" 2>/dev/null || true
   exec > >(tee -a "$LOG_FILE") 2>&1
   info "logging full output to $LOG_FILE"
 }
