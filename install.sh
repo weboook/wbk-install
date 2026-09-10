@@ -1019,7 +1019,7 @@ write_env_file() {
     return
   fi
 
-  local rp_id origin
+  local rp_id origin panel_db_password
   if [ -n "$PANEL_DOMAIN" ]; then
     rp_id="$PANEL_DOMAIN"
     origin="https://${PANEL_DOMAIN}"
@@ -1027,6 +1027,11 @@ write_env_file() {
     rp_id="$PANEL_IP"
     origin="http://${PANEL_IP}:${PANEL_HOST_PORT}"
   fi
+  # Captured once into a variable (rather than a second $(random_secret 32)
+  # inline below) so PANEL_DB_PASSWORD and DATABASE_URL's embedded password
+  # are guaranteed to be the exact same value, not two independently
+  # generated ones.
+  panel_db_password=$(random_secret 32)
 
   cat > "$WBK_INSTALL_DIR/.env" <<EOF
 JWT_SECRET=$(random_secret 48)
@@ -1035,6 +1040,7 @@ ADMIN_BOOTSTRAP_EMAIL=${ADMIN_EMAIL}
 ADMIN_BOOTSTRAP_PASSWORD=${ADMIN_PASSWORD}
 MARIADB_PROVISIONER_PASSWORD=$(random_secret 32)
 POSTGRES_PROVISIONER_PASSWORD=$(random_secret 32)
+PANEL_DB_PASSWORD=${panel_db_password}
 PDNS_API_KEY=$(random_secret 32)
 REDIS_PROVISIONER_PASSWORD=$(random_secret 32)
 MARIADB_MAIL_RO_PASSWORD=$(random_secret 32)
@@ -1050,11 +1056,31 @@ EOF
   # wbk-api.service's own Environment= lines (services/agent/*.service), and
   # are spelled out here too so anything reading .env directly (the wbk CLI,
   # an operator's own shell) sees the same layout the units do.
+  #
+  # DATABASE_URL defaults to Postgres, not sqlite, as of docs/next-phase.md's
+  # panel database migration plan's Phase 7 - the last of that plan's phases,
+  # flipped after Phases 1-5 (connection pooling, self-update's Postgres-
+  # native dry-run/snapshot/rollback, `wbk selftest --postgres`,
+  # migrate_sqlite_to_postgres.py) were each done and verified. Phase 6 (a
+  # pilot on a small fleet of real boxes before flipping the default) was
+  # deliberately waived rather than completed - this operator runs a single
+  # production box, so there is no separate fleet to pilot on; that box IS
+  # effectively the pilot, which is a real, accepted tradeoff worth stating
+  # plainly rather than pretending Phase 6 happened when it did not.
+  # `wbk_panel` (its own role, LOGIN only, no
+  # CREATEDB/CREATEROLE - narrower than wbk_provisioner, which needs both for
+  # tenant database provisioning) and its own database of the same name are
+  # provisioned by bootstrap_native_panel_database (native-install.sh),
+  # called from run_native_install below, before run_native_migrations runs
+  # `alembic upgrade head` against it - same server tenant PostgreSQL
+  # databases already share (127.0.0.1:5432, the postgresql package this
+  # installer already installs unconditionally), a separate database and
+  # role rather than a second instance.
   cat >> "$WBK_INSTALL_DIR/.env" <<EOF
 WBK_APP_ROOT=${WBK_INSTALL_DIR}
 WBK_DATA_ROOT=${WBK_DATA_ROOT_NATIVE}
 WBK_SERVICE_MANAGER=systemd
-DATABASE_URL=sqlite:///${WBK_DATA_ROOT_NATIVE}/wbk.db
+DATABASE_URL=postgresql://wbk_panel:${panel_db_password}@127.0.0.1:5432/wbk_panel
 BACKUP_STAGING_DIR=${WBK_DATA_ROOT_NATIVE}/backup-staging
 TICKET_ATTACHMENTS_DIR=${WBK_DATA_ROOT_NATIVE}/ticket-attachments
 UPDATES_DEPLOY_KEY_PATH=${WBK_DEPLOY_KEY_PATH}
